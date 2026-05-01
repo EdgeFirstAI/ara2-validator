@@ -94,7 +94,27 @@ The numbers above measure *validation* mask cost: the validator calls HAL's `mat
 
 For the canonical live-pipeline pattern (camera → NPU → fused draw_masks → Wayland compositor) see [`ara2-rs/examples/yolov8_live.py`](https://github.com/EdgeFirstAI/ara2-rs/blob/main/examples/yolov8_live.py); for the API surface see HAL's `ImageProcessor.draw_masks` and `ImageProcessor.draw_decoded_masks`. The *EdgeFirst for i.MX Reference Manual* documents the full `edgefirstoverlay` per-stage timing methodology that this script mirrors.
 
-End-to-end throughput in any threshold setting can be increased further by overlapping the preprocess of frame *N+1* with the inference of frame *N* (an async pipeline). That work is out of scope for this validator, which focuses on documenting per-stage latency and accuracy under a serial, deterministic execution model.
+## Serial vs concurrent pipelines
+
+The end-to-end numbers above come from a **serial** execution model: each stage runs to completion before the next begins, one frame at a time. That is what makes the per-stage breakdown additive — the total is exactly the sum of the parts, with no overlap to disentangle, which is the entire point of a benchmarking + validation tool.
+
+![Serial pipeline timeline](assets/diagram_serial_execution.png)
+
+Drawn as a waterfall, the headroom becomes obvious: while any single stage runs, every other stage is idle. The GPU sits unused during NPU inference; the NPU sits unused during preprocess; the host sits unused during DMA transfers. Mask decode at 18 ms is the visible bottleneck — see the deployment-threshold caveat below.
+
+![Pipeline waterfall](assets/diagram_pipeline.waterfall.png)
+
+A throughput-tuned deployment can overlap stages across consecutive frames — start preprocessing frame *N+1* the moment frame *N*'s preprocess finishes, regardless of whether frame *N*'s NPU inference is still running. Once the pipeline is filled, the throughput *period* collapses from the **sum** of stages (40.3 ms here) to the **slowest single stage** (18.0 ms here, mask decode → 55.6 FPS).
+
+![Concurrent pipeline](assets/diagram_pipeline_overlap.png)
+
+Per-frame **latency** is unchanged. Any one frame still has to walk through every stage in order, and the end-to-end clock from sensor capture to rendered output is identical to the serial case. Concurrent pipelining is therefore a *throughput* optimisation; it does not make any individual frame complete faster, which is why latency-critical paths (closed-loop control, AR overlays) cannot escape the per-stage budget by adding parallelism. Implementing the concurrent pipeline is out of scope for this validator — overlap would obscure the per-stage attribution this tool exists to capture — but the pattern is documented in the EdgeFirst HAL and `ara2-rs` examples.
+
+### How the validator pipeline mirrors deployment
+
+Execution scheduling aside, the validator's data path is the same path a live camera pipeline uses on this hardware. Frames are loaded from disk rather than from a sensor, but they are loaded straight into **DMA-BUF-backed EdgeFirst tensors** — the same tensor type `edgefirst-ara2` produces from a V4L2 capture. From the GPU letterbox onward, the validator and a live pipeline see identical surfaces: the GPU writes the NPU input DMA-BUF in place, the NPU produces an output DMA-BUF, HAL's Decoder reads it without staging, and HAL's mask materialisation runs against the same proto tensor. Swapping the disk loader for a camera capture is the only change needed to repurpose `HalPipeline` as the inner loop of a live application — and that is exactly the shape of [`ara2-rs/examples/yolov8_live.py`](https://github.com/EdgeFirstAI/ara2-rs/blob/main/examples/yolov8_live.py).
+
+One caveat is worth calling out: the **mask decode** stage is inflated here relative to a deployment. Validation uses Ultralytics' `val`-default score threshold of `0.001`, which keeps a long tail of low-confidence detections so pycocotools can integrate the full precision-recall curve — on the order of ~100 surviving detections per frame to materialise. A deployment using `--score-threshold 0.5` produces an order of magnitude fewer detections, and the per-detection mask cost drops with it. See [Deployment-style timing](#deployment-style-timing) for the same model and hardware running under deployment-style thresholds.
 
 ## Installation
 
