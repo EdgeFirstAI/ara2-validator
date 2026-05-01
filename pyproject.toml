@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ara2-validator"
+version = "0.1.0"
+description = "Standalone NXP Ara240 DVM inference reference with COCO JSON output"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "Pillow",
+    "pycocotools",
+]
+
+[project.optional-dependencies]
+# 0.18.0 added the batched-GEMM materialize_masks path (PR #54) and the
+# squeeze_padding_dims schema-v2 fix (commit 8f0ab5c). 0.18.1 restored
+# the rayon parallelism + per-detection logit-precompute path that
+# PR #51 inadvertently dropped during the f16 dispatch refactor (17×
+# speedup on materialize_hal at imx8mp-frdm). Both are required for
+# correct + fast COCO segmentation evaluation. See
+# https://github.com/EdgeFirstAI/hal README § Optimization Guide for the
+# rule set this validator follows.
+hal = ["edgefirst-hal>=0.18.1"]
+onnx = ["onnxruntime"]
+
+[project.scripts]
+ara2-validator = "ara2_validator.__main__:main"
