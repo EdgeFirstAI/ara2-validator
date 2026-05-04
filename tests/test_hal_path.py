@@ -2,8 +2,9 @@
 
 Pins the API surface this validator depends on:
 
-- ``edgefirst_hal>=0.18.1`` (batched-GEMM materialize_masks +
-  squeeze_padding_dims schema-v2 fix; see HAL README § Rules 7-8)
+- ``edgefirst_hal>=0.18.2`` (batched-GEMM materialize_masks +
+  squeeze_padding_dims schema-v2 fix + mask decoding optimizations;
+  see HAL README § Rules 7-8)
 - ``MaskResolution.Scaled`` constructor accepts ``(width, height)``
 - ``materialize_masks_for_coco`` helper produces masks at original
   image resolution
@@ -32,16 +33,16 @@ hal = pytest.importorskip(
 # ── Version + API surface ─────────────────────────────────────────────────────
 
 def test_hal_version_floor():
-    """edgefirst_hal must be >= 0.18.1 — earlier versions miss either
-    the batched-GEMM materialize_masks path (added in 0.18.0) or the
+    """edgefirst_hal must be >= 0.18.2 — earlier versions miss either
+    the batched-GEMM materialize_masks path (added in 0.18.0), the
     rayon-parallel restoration that PR #51 regressed and 0.18.1
-    re-applied (17× speedup on materialize_hal).
+    re-applied, or the mask decoding optimizations added in 0.18.2.
     """
     ver = importlib.metadata.version("edgefirst_hal")
     parts = tuple(int(p) for p in ver.split("+", 1)[0].split(".")[:3])
-    assert parts >= (0, 18, 1), (
+    assert parts >= (0, 18, 2), (
         f"edgefirst_hal {ver} is too old; this validator requires "
-        f">= 0.18.1 for correctness and performance")
+        f">= 0.18.2 for correctness and performance")
 
 
 def test_mask_resolution_scaled_api():
@@ -208,7 +209,7 @@ def test_back_compat_shim_emits_deprecation_warning():
 
 
 def test_pyproject_pins_hal_floor():
-    """The hal extra in pyproject.toml must include the >= 0.18.1
+    """The hal extra in pyproject.toml must include the >= 0.18.2
     floor — without it, an environment with an older HAL would
     silently use the slow scalar materializer and the lossy proto-
     only mask path.
@@ -227,5 +228,5 @@ def test_pyproject_pins_hal_floor():
     with pyproject.open("rb") as f:
         data = _toml.load(f)
     hal_dep = data["project"]["optional-dependencies"]["hal"]
-    assert any(">=0.18.1" in d or ">= 0.18.1" in d for d in hal_dep), (
-        f"hal extra must pin edgefirst-hal >= 0.18.1; got {hal_dep!r}")
+    assert any(">=0.18.2" in d or ">= 0.18.2" in d for d in hal_dep), (
+        f"hal extra must pin edgefirst-hal >= 0.18.2; got {hal_dep!r}")

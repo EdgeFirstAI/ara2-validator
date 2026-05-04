@@ -146,7 +146,8 @@ def main() -> int:
     # path. The batched-GEMM materializer + squeeze_padding_dims
     # schema-v2 fix landed in HAL 0.18.0 (PR #54); the rayon-parallel
     # restoration + per-detection logit-precompute path landed in
-    # 0.18.1, which is the validator's floor.
+    # 0.18.1; further mask decoding optimizations landed in 0.18.2,
+    # which is the validator's floor.
     try:
         hal_ver = importlib.metadata.version("edgefirst_hal")
     except Exception:  # noqa: BLE001 — version lookup must not fail the run

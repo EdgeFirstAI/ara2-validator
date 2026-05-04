@@ -20,10 +20,11 @@ can copy them verbatim into their own pipeline. Specifically, they:
   ``paste_ms`` (canvas paste), and ``rle_ms`` (RLE encode) so the
   caller can attribute regressions between HAL and caller-side code.
 
-Requires ``edgefirst-hal>=0.18.1`` for the batched-GEMM
+Requires ``edgefirst-hal>=0.18.2`` for the batched-GEMM
 ``materialize_masks`` path with rayon parallelism, the
-``squeeze_padding_dims`` schema-v2 fix, and the per-detection logit-
-precompute path. See HAL ``README § Optimization Guide`` Rule 8.
+``squeeze_padding_dims`` schema-v2 fix, per-detection logit-
+precompute path, and further mask decoding optimizations. See
+HAL ``README § Optimization Guide`` Rule 8.
 """
 
 from __future__ import annotations
@@ -138,7 +139,7 @@ def _materialize_tiles(
     if hal is None:
         raise ImportError(
             "edgefirst_hal is required for materialize_masks_for_coco. "
-            "Install with: pip install 'edgefirst-hal>=0.18.1'"
+            "Install with: pip install 'edgefirst-hal>=0.18.2'"
         )
 
     # Letterbox region in normalised model-input coords.

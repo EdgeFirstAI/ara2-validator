@@ -42,11 +42,11 @@ All scripts run on-target so the per-stage timings are directly comparable. Top 
 | `onnx_reference` (FP32, on-target CPU) | fast | 0.4533 | 0.3337 | 1.8 ms | 44.6 ms | 47.8 ms | 94.1 ms |
 | `reference` (dvapi+numpy) | retina | 0.3941 | 0.3278 | 21.1 ms | 18.0 ms | 412.9 ms | 452.2 ms |
 | `reference` (dvapi+numpy) | fast | 0.3941 | 0.3221 | 20.6 ms | 18.2 ms | 293.4 ms | 332.3 ms |
-| `edgefirst` (HAL) | retina | 0.3970 | 0.3220 | 6.2 ms | 13.7 ms | 44.3 ms | **64.2 ms** |
-| `edgefirst` (HAL) | fast | 0.3970 | 0.3142 | 6.2 ms | 13.7 ms | 24.0 ms | **43.9 ms** |
+| `edgefirst` (HAL) | retina | 0.3955 | 0.3218 | 6.2 ms | 13.7 ms | 24.6 ms | **44.4 ms** |
+| `edgefirst` (HAL) | fast | 0.3955 | 0.3095 | 6.2 ms | 13.7 ms | 19.4 ms | **39.3 ms** |
 | **imx95-frdm** | | | | | | | |
-| `edgefirst` (HAL) | retina | 0.3981 | 0.3233 | 4.2 ms | 12.0 ms | 39.3 ms | **55.6 ms** |
-| `edgefirst` (HAL) | fast | 0.3981 | 0.3152 | 4.1 ms | 12.0 ms | 24.2 ms | **40.2 ms** |
+| `edgefirst` (HAL) | retina | 0.3966 | 0.3231 | 4.2 ms | 11.9 ms | 24.6 ms | **40.8 ms** |
+| `edgefirst` (HAL) | fast | 0.3966 | 0.3103 | 4.2 ms | 11.9 ms | 20.7 ms | **36.8 ms** |
 
 `Post` = NMS decode + mask materialisation. `End-to-end` = preprocess + inference + postprocess. RLE-encoding the binary masks is reported separately as output formatting (only relevant to validation, not deployment). The dvapi+numpy reference is omitted from the imx95 block because the dvproxy / `libaraclient` stack on that board needs intermittent restarts before each long run; the HAL path via `edgefirst-ara2` is unaffected.
 
@@ -57,8 +57,8 @@ The `Inf` column above is the wall-clock time `model.run()` takes — input-in, 
 | | DMA host→device | NPU compute | DMA device→host | Driver subtotal | Wall-clock roundtrip | Host overhead |
 |---|---:|---:|---:|---:|---:|---:|
 | `reference` (dvapi) on imx8mp | 2.17 ms | 4.40 ms | 4.66 ms | 11.23 ms | **17.94 ms** | 6.71 ms |
-| `edgefirst` (ara2-rs) on imx8mp | 2.23 ms | 4.40 ms | 4.93 ms | 11.56 ms | **13.67 ms** | 2.11 ms |
-| `edgefirst` (ara2-rs) on imx95 | 1.98 ms | 4.40 ms | 3.15 ms | 9.53 ms | **12.00 ms** | 2.47 ms |
+| `edgefirst` (ara2-rs) on imx8mp | 2.24 ms | 4.40 ms | 4.93 ms | 11.57 ms | **13.68 ms** | 2.11 ms |
+| `edgefirst` (ara2-rs) on imx95 | 1.99 ms | 4.43 ms | 3.17 ms | 9.59 ms | **12.00 ms** | 2.41 ms |
 
 The ~4.6 ms host-overhead delta between dvapi and edgefirst on imx8mp is the DMA-BUF benefit. The dvapi path moves the input tensor through a host buffer (numpy → libaraclient ctypes → dvproxy) and the output tensor back the same way; the edgefirst path uses `Tensor.from_fd` to wrap the dvproxy DMA-BUF directly, so the GPU letterbox writes the input DMA-BUF in place and HAL's Decoder reads the output DMA-BUF in place — the host never touches either buffer. The `HalPipeline` class is what wires this up; see its docstring for the construct-once / reuse-many invariants HAL Optimization Guide Rules 1, 4, and 5 require to keep the path zero-copy.
 
@@ -100,11 +100,11 @@ The end-to-end numbers above come from a **serial** execution model: each stage 
 
 ![Serial pipeline timeline](assets/diagram_serial_execution.png)
 
-Drawn as a waterfall, the headroom becomes obvious: while any single stage runs, every other stage is idle. The GPU sits unused during NPU inference; the NPU sits unused during preprocess; the host sits unused during DMA transfers. Mask decode at 18 ms is the visible bottleneck — see the deployment-threshold caveat below.
+Drawn as a waterfall, the headroom becomes obvious: while any single stage runs, every other stage is idle. The GPU sits unused during NPU inference; the NPU sits unused during preprocess; the host sits unused during DMA transfers. NMS decode at 18 ms is the visible bottleneck — see the deployment-threshold caveat below.
 
 ![Pipeline waterfall](assets/diagram_pipeline.waterfall.png)
 
-A throughput-tuned deployment can overlap stages across consecutive frames — start preprocessing frame *N+1* the moment frame *N*'s preprocess finishes, regardless of whether frame *N*'s NPU inference is still running. Once the pipeline is filled, the throughput *period* collapses from the **sum** of stages (40.3 ms here) to the **slowest single stage** (18.0 ms here, mask decode → 55.6 FPS).
+A throughput-tuned deployment can overlap stages across consecutive frames — start preprocessing frame *N+1* the moment frame *N*'s preprocess finishes, regardless of whether frame *N*'s NPU inference is still running. Once the pipeline is filled, the throughput *period* collapses from the **sum** of stages (40.8 ms here) to the **slowest single stage** (24.6 ms here, postprocess → 40.7 FPS).
 
 ![Concurrent pipeline](assets/diagram_pipeline_overlap.png)
 
@@ -130,7 +130,7 @@ pip install --upgrade pip
 pip install 'ara2-validator[hal] @ git+https://github.com/EdgeFirstAI/ara2-validator.git'
 ```
 
-The `[hal]` extra pulls [`edgefirst-hal>=0.18.1`](https://github.com/EdgeFirstAI/hal) and `edgefirst-ara2`. The `>=0.18.1` floor is required: earlier versions ship either a scalar `materialize_masks` (0.17.x, ~569 ms / image at N=119 detections) or a single-threaded variant (0.18.0, regressed by PR #51). 0.18.1 restores the rayon-parallel + per-detection logit-precompute path for ~33 ms / image.
+The `[hal]` extra pulls [`edgefirst-hal>=0.18.2`](https://github.com/EdgeFirstAI/hal) and `edgefirst-ara2`. The `>=0.18.2` floor is required: 0.17.x ships a scalar `materialize_masks` (~569 ms / image at N=119 detections), 0.18.0 regressed rayon parallelism (PR #51), 0.18.1 restored it (~33 ms / image), and 0.18.2 adds further mask decoding optimizations (~9 ms / image on imx8mp-frdm retina).
 
 ### Host (FP32 ONNX baseline)
 
@@ -350,7 +350,7 @@ int8 quantisation produces protos that are near-identical but not bit-identical 
 
 ### `edgefirst`
 
-- `edgefirst-hal>=0.18.1` — GPU-accelerated preprocessing and postprocessing (the floor is required: 0.17.x ships a scalar `materialize_masks` ~17× slower; 0.18.0 dropped the rayon parallelism the kernel needs and 0.18.1 restored it)
+- `edgefirst-hal>=0.18.2` — GPU-accelerated preprocessing and postprocessing (the floor is required: 0.17.x ships a scalar `materialize_masks` ~17× slower; 0.18.0 dropped the rayon parallelism the kernel needs; 0.18.1 restored it; 0.18.2 adds further mask decoding optimizations)
 - `edgefirst-ara2` — Rust/pyo3 wrapper around libaraclient with DMA-BUF tensor mapping
 - Same `dvproxy` + `libaraclient.so` requirements as `reference`
 

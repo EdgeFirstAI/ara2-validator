@@ -19,11 +19,12 @@ dependencies = [
 # squeeze_padding_dims schema-v2 fix (commit 8f0ab5c). 0.18.1 restored
 # the rayon parallelism + per-detection logit-precompute path that
 # PR #51 inadvertently dropped during the f16 dispatch refactor (17×
-# speedup on materialize_hal at imx8mp-frdm). Both are required for
-# correct + fast COCO segmentation evaluation. See
+# speedup on materialize_hal at imx8mp-frdm). 0.18.2 adds further mask
+# decoding optimizations (materialize_hal 33 ms → 9 ms on retina). All
+# are required for correct + fast COCO segmentation evaluation. See
 # https://github.com/EdgeFirstAI/hal README § Optimization Guide for the
 # rule set this validator follows.
-hal = ["edgefirst-hal>=0.18.1"]
+hal = ["edgefirst-hal>=0.18.2"]
 onnx = ["onnxruntime"]
 
 [project.scripts]

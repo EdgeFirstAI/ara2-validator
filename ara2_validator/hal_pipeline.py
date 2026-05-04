@@ -129,7 +129,7 @@ class HalPipeline:
         if hal is None:
             raise ImportError(
                 "edgefirst_hal is required for HalPipeline. "
-                "Install with: pip install 'edgefirst-hal>=0.18.1'"
+                "Install with: pip install 'edgefirst-hal>=0.18.2'"
             )
 
         self.model = model
