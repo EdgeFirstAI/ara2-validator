@@ -50,22 +50,22 @@ All scripts run on-target so the per-stage timings are directly comparable. Two 
 | `onnx_reference` (FP32, on-target CPU) | fast | 0.4533 | 0.3337 | 1.8 ms | 44.6 ms | — | 47.8 ms | 94.1 ms |
 | `reference` (dvapi+numpy) | retina | 0.3941 | 0.3278 | 21.1 ms | 18.0 ms | — | 412.9 ms | 452.2 ms |
 | `reference` (dvapi+numpy) | fast | 0.3941 | 0.3221 | 20.6 ms | 18.2 ms | — | 293.4 ms | 332.3 ms |
-| `edgefirst` (HAL) | retina | 0.3955 | 0.3218 | 6.2 ms | 13.3 ms | 5.1 ms | 7.4 ms | **32.1 ms** |
-| `edgefirst` (HAL) | fast | 0.3955 | 0.3095 | 6.3 ms | 13.4 ms | 5.1 ms | 2.4 ms | **27.1 ms** |
+| `edgefirst` (HAL) | retina | 0.3955 | 0.3218 | 6.2 ms | 13.5 ms | 2.6 ms | 9.7 ms | **32.0 ms** |
+| `edgefirst` (HAL) | fast | 0.3955 | 0.3095 | 6.2 ms | 13.5 ms | 2.6 ms | 3.8 ms | **26.1 ms** |
 | **imx95-frdm** | | | | | | | | |
-| `edgefirst` (HAL) | retina | 0.3966 | 0.3231 | 4.0 ms | 11.2 ms | 5.9 ms | 6.6 ms | **27.8 ms** |
-| `edgefirst` (HAL) | fast | 0.3966 | 0.3103 | 4.1 ms | 11.4 ms | 6.0 ms | 2.2 ms | **23.6 ms** |
+| `edgefirst` (HAL) | retina | 0.3966 | 0.3231 | 4.1 ms | 11.3 ms | 2.6 ms | 7.6 ms | **25.5 ms** |
+| `edgefirst` (HAL) | fast | 0.3966 | 0.3103 | 4.1 ms | 11.3 ms | 2.5 ms | 2.9 ms | **20.8 ms** |
 
 #### Deployment threshold (`--score-threshold 0.5`)
 
 | Script | Mask | Box mAP | Mask mAP | Pre | Inf | NMS | Mask | End-to-end |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
 | **imx8mp-frdm** | | | | | | | | |
-| `edgefirst` (HAL) | retina | 0.2778 | 0.2434 | 6.2 ms | 13.4 ms | 4.8 ms | 3.7 ms | **28.1 ms** |
-| `edgefirst` (HAL) | fast | 0.2778 | 0.2364 | 6.1 ms | 13.3 ms | 4.8 ms | 1.3 ms | **25.5 ms** |
+| `edgefirst` (HAL) | retina | 0.2778 | 0.2434 | 6.1 ms | 13.4 ms | 2.2 ms | 3.5 ms | **25.2 ms** |
+| `edgefirst` (HAL) | fast | 0.2778 | 0.2364 | 6.2 ms | 13.4 ms | 2.3 ms | 1.8 ms | **23.6 ms** |
 | **imx95-frdm** | | | | | | | | |
-| `edgefirst` (HAL) | retina | 0.2793 | 0.2475 | 3.9 ms | 11.2 ms | 5.5 ms | 4.0 ms | **24.6 ms** |
-| `edgefirst` (HAL) | fast | 0.2793 | 0.2395 | 3.9 ms | 11.3 ms | 5.4 ms | 1.3 ms | **21.8 ms** |
+| `edgefirst` (HAL) | retina | 0.2793 | 0.2475 | 3.9 ms | 11.3 ms | 2.1 ms | 3.3 ms | **20.5 ms** |
+| `edgefirst` (HAL) | fast | 0.2793 | 0.2395 | 3.9 ms | 11.3 ms | 2.2 ms | 1.5 ms | **18.9 ms** |
 
 The `0.5` threshold reduces mAP by ~30% (0.40 → 0.28 Box, 0.32 → 0.24 Mask) because pycocotools can no longer integrate the full precision-recall curve — high-recall operating points are unreachable when low-confidence true positives are discarded before submission. This is an evaluation artefact, not a model quality difference: the model's actual detection capability is unchanged, only the evaluator's ability to measure it is truncated.
 
@@ -119,11 +119,11 @@ The end-to-end numbers above come from a **serial** execution model: each stage 
 
 ![Serial pipeline timeline](assets/diagram_serial_execution.png)
 
-Drawn as a waterfall, the headroom becomes obvious: while any single stage runs, every other stage is idle. The GPU sits unused during NPU inference; the NPU sits unused during preprocess; the host sits unused during DMA transfers. With the NMS/Mask split visible, inference at 13 ms is the longest single stage; NMS (5 ms) and Mask (7 ms) are independent of the GPU and NPU and could overlap with the next frame's preprocess or inference in a pipelined deployment.
+Drawn as a waterfall, the headroom becomes obvious: while any single stage runs, every other stage is idle. The GPU sits unused during NPU inference; the NPU sits unused during preprocess; the host sits unused during DMA transfers. With the NMS/Mask split visible, inference at 13 ms is the longest single stage; NMS (2.6 ms) and Mask (7.6 ms) are independent of the GPU and NPU and could overlap with the next frame's preprocess or inference in a pipelined deployment.
 
 ![Pipeline waterfall](assets/diagram_pipeline.waterfall.png)
 
-A throughput-tuned deployment can overlap stages across consecutive frames — start preprocessing frame *N+1* the moment frame *N*'s preprocess finishes, regardless of whether frame *N*'s NPU inference is still running. With four pipeline stages (Pre 6 ms | Inf 13 ms | NMS 5 ms | Mask 7 ms), once the pipeline is filled the throughput *period* collapses to the **slowest single stage** (13.3 ms, inference → 75 FPS). NMS and Mask together (12.5 ms) fit inside the inference window, so they are fully hidden in the concurrent case.
+A throughput-tuned deployment can overlap stages across consecutive frames — start preprocessing frame *N+1* the moment frame *N*'s preprocess finishes, regardless of whether frame *N*'s NPU inference is still running. With four pipeline stages (Pre 6 ms | Inf 13 ms | NMS 2.6 ms | Mask 9.7 ms), once the pipeline is filled the throughput *period* collapses to the **slowest single stage** (13.5 ms, inference → 74 FPS). NMS and Mask together (12.3 ms) fit inside the inference window, so they are fully hidden in the concurrent case.
 
 ![Concurrent pipeline](assets/diagram_pipeline_overlap.png)
 
@@ -133,7 +133,7 @@ Per-frame **latency** is unchanged. Any one frame still has to walk through ever
 
 Execution scheduling aside, the validator's data path is the same path a live camera pipeline uses on this hardware. Frames are loaded from disk rather than from a sensor, but they are loaded straight into **DMA-BUF-backed EdgeFirst tensors** — the same tensor type `edgefirst-ara2` produces from a V4L2 capture. From the GPU letterbox onward, the validator and a live pipeline see identical surfaces: the GPU writes the NPU input DMA-BUF in place, the NPU produces an output DMA-BUF, HAL's Decoder reads it without staging, and HAL's mask materialisation runs against the same proto tensor. Swapping the disk loader for a camera capture is the only change needed to repurpose `HalPipeline` as the inner loop of a live application — and that is exactly the shape of [`ara2-rs/examples/yolov8_live.py`](https://github.com/EdgeFirstAI/ara2-rs/blob/main/examples/yolov8_live.py).
 
-One caveat is worth calling out: **both NMS and Mask stages are threshold-dependent.** The validation table (threshold `0.001`) retains many more candidate detections through NMS and materialises more masks than a deployment would. Compare the two tables above: at `0.5`, NMS drops from 5.1 ms to 4.8 ms (fewer candidates to sort) and Mask drops from 7.4 ms to 3.7 ms (fewer surviving detections to materialise). For the fused `draw_masks` deployment path, see [Fused draw_masks timing](#fused-draw_masks-timing).
+One caveat is worth calling out: **both NMS and Mask stages are threshold-dependent.** The validation table (threshold `0.001`) retains many more candidate detections through NMS and materialises more masks than a deployment would. Compare the two tables above: at `0.5`, NMS drops from 2.6 ms to 2.2 ms (fewer candidates to sort) and Mask drops from 9.7 ms to 3.5 ms (fewer surviving detections to materialise). For the fused `draw_masks` deployment path, see [Fused draw_masks timing](#fused-draw_masks-timing).
 
 ## Installation
 
@@ -149,7 +149,7 @@ pip install --upgrade pip
 pip install 'ara2-validator[hal] @ git+https://github.com/EdgeFirstAI/ara2-validator.git'
 ```
 
-The `[hal]` extra pulls [`edgefirst-hal>=0.18.2`](https://github.com/EdgeFirstAI/hal) and `edgefirst-ara2`. The `>=0.18.2` floor is required: 0.17.x ships a scalar `materialize_masks` (~569 ms / image at N=119 detections), 0.18.0 regressed rayon parallelism (PR #51), 0.18.1 restored it (~33 ms / image), and 0.18.2 adds NMS decode and mask materialisation optimizations (~8 ms / image on imx8mp-frdm retina).
+The `[hal]` extra pulls [`edgefirst-hal>=0.18.2`](https://github.com/EdgeFirstAI/hal) and `edgefirst-ara2`. The `>=0.18.2` floor is required: 0.17.x ships a scalar `materialize_masks` (~569 ms / image at N=119 detections), 0.18.0 regressed rayon parallelism (PR #51), 0.18.1 restored it (~33 ms / image), and 0.18.2 adds NMS decode, NCHW proto layout elimination, and mask materialisation optimizations (NMS 2.6 ms + Mask 9.7 ms on imx8mp-frdm retina at validation threshold).
 
 ### Host (FP32 ONNX baseline)
 
@@ -303,19 +303,19 @@ Each run prints a timing table:
 
 ```
 Stage                               Mean      Min      Max  ms
-preprocess (GPU)                    4.20     3.56     5.20
-inference (wall)                   11.92    11.67    12.37
-  dma input (host→device)             1.98     1.95     2.10
-  dma output (device→host)            3.15     3.05     3.27
-postprocess (nms+mask)             24.64    19.93    31.84
-  nms_decode (HAL)                   18.43    16.39    20.54
-  materialize_hal                     6.22     2.84    13.61
-  Model-path (pre+inf+post, excl. output): 40.77 ms (24.6 FPS)
+preprocess (GPU)                    4.11     3.34     4.79
+inference (wall)                   11.25    11.03    11.52
+  dma input (host→device)             1.96     1.95     2.03
+  dma output (device→host)            2.96     2.94     3.01
+postprocess (nms+mask)             10.12     3.66    24.60
+  nms_decode (HAL)                    2.56     2.19     2.98
+  materialize_hal                     7.55     1.33    21.97
+  Model-path (pre+inf+post, excl. output): 25.47 ms (39.3 FPS)
 ```
 
 Key metrics to compare:
 - **nms_decode** — NMS + dequantisation in compiled Rust
-- **materialize_hal** — mask materialisation (retina ~6–9 ms, fast ~2–3 ms)
+- **materialize_hal** — mask materialisation (retina ~7–10 ms, fast ~2–3 ms)
 - **Model-path** — end-to-end excluding output formatting (the number reported in the timing table above)
 
 Accuracy is reported below the timing table as Box mAP@0.50:0.95 and Mask mAP@0.50:0.95.
