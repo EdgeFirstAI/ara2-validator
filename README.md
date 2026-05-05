@@ -33,7 +33,15 @@ The full COCO val2017 set. Drift columns are absolute **percentage points** (`mA
 
 ### coco128 — per-stage timing (128 images)
 
-All scripts run on-target so the per-stage timings are directly comparable. Top block is imx8mp-frdm; bottom block is imx95-frdm.
+All scripts run on-target so the per-stage timings are directly comparable. Two tables are shown: the first uses a **validation** score threshold of `0.001` (required for correct mAP computation — see note below); the second uses a **deployment** threshold of `0.5`, representative of real-time inference.
+
+> [!IMPORTANT]
+> **NMS and Mask timings are strongly threshold-dependent.** At the validation threshold of `0.001`, the model retains ~100–300 candidate detections per frame for NMS and ~5–15 surviving detections for mask materialisation. At a deployment threshold of `0.5`, only ~2–5 high-confidence detections survive, and both NMS and Mask drop accordingly. The validation table represents a worst-case timing bound; the deployment table represents real-world performance.
+
+> [!NOTE]
+> **Why `0.001`?** pycocotools computes mAP by integrating the precision-recall curve over 101 recall levels. This requires submitting *all* detections that might contribute to any recall level — including low-confidence true positives that only matter at high-recall operating points. A threshold of `0.5` truncates the P-R curve early, causing mAP to be underestimated (see the mAP columns below). The `0.001` threshold is the Ultralytics `val` default and is required for comparable, standards-compliant COCO evaluation.
+
+#### Validation threshold (`--score-threshold 0.001`)
 
 | Script | Mask | Box mAP | Mask mAP | Pre | Inf | NMS | Mask | End-to-end |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
@@ -48,7 +56,20 @@ All scripts run on-target so the per-stage timings are directly comparable. Top 
 | `edgefirst` (HAL) | retina | 0.3966 | 0.3231 | 4.0 ms | 11.2 ms | 5.9 ms | 6.6 ms | **27.8 ms** |
 | `edgefirst` (HAL) | fast | 0.3966 | 0.3103 | 4.1 ms | 11.4 ms | 6.0 ms | 2.2 ms | **23.6 ms** |
 
-`NMS` = HAL nms_decode (dequantisation, top-K filtering, box decode, NMS). `Mask` = mask materialisation (proto matmul, sigmoid, crop, resize). `End-to-end` = Pre + Inf + NMS + Mask. RLE-encoding the binary masks is reported separately as output formatting (only relevant to validation, not deployment). The dvapi+numpy reference is omitted from the imx95 block because the dvproxy / `libaraclient` stack on that board needs intermittent restarts before each long run; the HAL path via `edgefirst-ara2` is unaffected. The `reference` and `onnx_reference` rows don't split NMS from Mask because Ultralytics performs both in a single fused `postprocess()` call.
+#### Deployment threshold (`--score-threshold 0.5`)
+
+| Script | Mask | Box mAP | Mask mAP | Pre | Inf | NMS | Mask | End-to-end |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| **imx8mp-frdm** | | | | | | | | |
+| `edgefirst` (HAL) | retina | 0.2778 | 0.2434 | 6.2 ms | 13.4 ms | 4.8 ms | 3.7 ms | **28.1 ms** |
+| `edgefirst` (HAL) | fast | 0.2778 | 0.2364 | 6.1 ms | 13.3 ms | 4.8 ms | 1.3 ms | **25.5 ms** |
+| **imx95-frdm** | | | | | | | | |
+| `edgefirst` (HAL) | retina | 0.2793 | 0.2475 | 3.9 ms | 11.2 ms | 5.5 ms | 4.0 ms | **24.6 ms** |
+| `edgefirst` (HAL) | fast | 0.2793 | 0.2395 | 3.9 ms | 11.3 ms | 5.4 ms | 1.3 ms | **21.8 ms** |
+
+The `0.5` threshold reduces mAP by ~30% (0.40 → 0.28 Box, 0.32 → 0.24 Mask) because pycocotools can no longer integrate the full precision-recall curve — high-recall operating points are unreachable when low-confidence true positives are discarded before submission. This is an evaluation artefact, not a model quality difference: the model's actual detection capability is unchanged, only the evaluator's ability to measure it is truncated.
+
+`NMS` = HAL nms_decode (dequantisation, top-K filtering, box decode, NMS). `Mask` = mask materialisation (proto matmul, sigmoid, crop, resize). `End-to-end` = Pre + Inf + NMS + Mask. The `reference` and `onnx_reference` rows don't split NMS from Mask because Ultralytics performs both in a single fused `postprocess()` call. The dvapi+numpy reference is omitted from the imx95 block because the dvproxy / `libaraclient` stack on that board needs intermittent restarts.
 
 #### NPU inference breakdown
 
@@ -62,16 +83,14 @@ The `Inf` column above is the wall-clock time `model.run()` takes — input-in, 
 
 The ~4.6 ms host-overhead delta between dvapi and edgefirst on imx8mp is the DMA-BUF benefit. The dvapi path moves the input tensor through a host buffer (numpy → libaraclient ctypes → dvproxy) and the output tensor back the same way; the edgefirst path uses `Tensor.from_fd` to wrap the dvproxy DMA-BUF directly, so the GPU letterbox writes the input DMA-BUF in place and HAL's Decoder reads the output DMA-BUF in place — the host never touches either buffer. The `HalPipeline` class is what wires this up; see its docstring for the construct-once / reuse-many invariants HAL Optimization Guide Rules 1, 4, and 5 require to keep the path zero-copy.
 
-> [!IMPORTANT]
-> These numbers use a validation NMS score threshold of `0.001` (the Ultralytics `val` default), which keeps a long tail of low-confidence detections to produce a complete precision-recall curve. A real deployment uses a higher threshold (typically `0.50`), reducing the surviving detection count and therefore the postprocess time. See [Deployment-style timing](#deployment-style-timing) for an example.
-
 ### What "end-to-end" measures
 
 `End-to-end` covers the per-frame work after image acquisition:
 
 1. **preprocess** — letterbox resize, normalise, quantise, lay out as the NPU's input tensor.
 2. **inference** — submit input, run NPU, retrieve output.
-3. **postprocess** — NMS over the dequantised detection grid, then materialise per-detection binary masks at original image resolution.
+3. **NMS decode** — dequantise the detection grid, apply top-K pre-filtering, decode box coordinates, run class-aware NMS.
+4. **mask materialisation** — per-detection proto coefficient × prototype matmul, sigmoid activation, crop to bbox, resize to original resolution.
 
 Stages excluded from end-to-end because they are validation-only or environment-specific:
 
@@ -79,9 +98,9 @@ Stages excluded from end-to-end because they are validation-only or environment-
 - **output formatting** — pycocotools RLE encoding for the COCO results JSON. A deployment would consume the binary masks directly.
 - **COCO evaluation** — pycocotools per-image mAP computation. Strictly an offline validation step.
 
-### Deployment-style timing
+### Fused draw_masks timing
 
-The numbers above measure *validation* mask cost: the validator calls HAL's `materialize_masks` and then RLE-encodes each per-detection mask for pycocotools. A live deployment doesn't do that — it composites masks straight onto a display canvas via HAL's fused `ImageProcessor.draw_masks`, which decodes, materialises, and blends in one Rust/GPU call without ever round-tripping per-detection masks through Python.
+The tables above measure *validation* mask cost: the validator calls HAL's `materialize_masks` per detection and then RLE-encodes each binary mask for pycocotools. A live deployment doesn't do that — it composites masks straight onto a display canvas via HAL's fused `ImageProcessor.draw_masks`, which decodes, materialises, and blends in one Rust/GPU call without ever round-tripping per-detection masks through Python.
 
 `tests/bench_draw_masks.py` runs the same 128-image set through that fused path at `--score-threshold 0.5`:
 
@@ -114,7 +133,7 @@ Per-frame **latency** is unchanged. Any one frame still has to walk through ever
 
 Execution scheduling aside, the validator's data path is the same path a live camera pipeline uses on this hardware. Frames are loaded from disk rather than from a sensor, but they are loaded straight into **DMA-BUF-backed EdgeFirst tensors** — the same tensor type `edgefirst-ara2` produces from a V4L2 capture. From the GPU letterbox onward, the validator and a live pipeline see identical surfaces: the GPU writes the NPU input DMA-BUF in place, the NPU produces an output DMA-BUF, HAL's Decoder reads it without staging, and HAL's mask materialisation runs against the same proto tensor. Swapping the disk loader for a camera capture is the only change needed to repurpose `HalPipeline` as the inner loop of a live application — and that is exactly the shape of [`ara2-rs/examples/yolov8_live.py`](https://github.com/EdgeFirstAI/ara2-rs/blob/main/examples/yolov8_live.py).
 
-One caveat is worth calling out: the **mask decode** stage is inflated here relative to a deployment. Validation uses Ultralytics' `val`-default score threshold of `0.001`, which keeps a long tail of low-confidence detections so pycocotools can integrate the full precision-recall curve — on the order of ~100 surviving detections per frame to materialise. A deployment using `--score-threshold 0.5` produces an order of magnitude fewer detections, and the per-detection mask cost drops with it. See [Deployment-style timing](#deployment-style-timing) for the same model and hardware running under deployment-style thresholds.
+One caveat is worth calling out: **both NMS and Mask stages are threshold-dependent.** The validation table (threshold `0.001`) retains many more candidate detections through NMS and materialises more masks than a deployment would. Compare the two tables above: at `0.5`, NMS drops from 5.1 ms to 4.8 ms (fewer candidates to sort) and Mask drops from 7.4 ms to 3.7 ms (fewer surviving detections to materialise). For the fused `draw_masks` deployment path, see [Fused draw_masks timing](#fused-draw_masks-timing).
 
 ## Installation
 
