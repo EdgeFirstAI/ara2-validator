@@ -37,8 +37,8 @@ This is the first publication-grade revision. The validator has been rewritten e
 
 ### Performance
 
-- **17× speedup on `materialize_hal`** (569 ms → 33 ms on imx8mp-frdm, N=119) via the HAL 0.18.0 batched-GEMM kernel + per-detection logit-precompute path restored in 0.18.1.
-- **End-to-end on imx8mp-frdm coco128** drops from 452 ms (`reference` retina) to 64 ms (`edgefirst` retina), with mask mAP within 0.6 pp of the dvapi reference.
+- **75× speedup on `materialize_hal`** (569 ms → 7.5 ms on imx8mp-frdm, N=119) via the HAL batched-GEMM kernel, rayon-parallel + per-detection logit-precompute path (0.18.1), and further mask decoding + NMS decode optimizations (0.18.2).
+- **End-to-end on imx8mp-frdm coco128** drops from 452 ms (`reference` retina) to 32 ms (`edgefirst` retina), with mask mAP within 0.6 pp of the dvapi reference.
 - **~10–30 ms saved per image** by reusing the `(orig_h, orig_w)` mask canvas instead of allocating per-detection.
 
 ### Validation

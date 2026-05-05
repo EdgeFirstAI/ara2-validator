@@ -42,11 +42,11 @@ All scripts run on-target so the per-stage timings are directly comparable. Top 
 | `onnx_reference` (FP32, on-target CPU) | fast | 0.4533 | 0.3337 | 1.8 ms | 44.6 ms | 47.8 ms | 94.1 ms |
 | `reference` (dvapi+numpy) | retina | 0.3941 | 0.3278 | 21.1 ms | 18.0 ms | 412.9 ms | 452.2 ms |
 | `reference` (dvapi+numpy) | fast | 0.3941 | 0.3221 | 20.6 ms | 18.2 ms | 293.4 ms | 332.3 ms |
-| `edgefirst` (HAL) | retina | 0.3955 | 0.3218 | 6.2 ms | 13.7 ms | 24.6 ms | **44.4 ms** |
-| `edgefirst` (HAL) | fast | 0.3955 | 0.3095 | 6.2 ms | 13.7 ms | 19.4 ms | **39.3 ms** |
+| `edgefirst` (HAL) | retina | 0.3955 | 0.3218 | 6.2 ms | 13.3 ms | 12.5 ms | **32.1 ms** |
+| `edgefirst` (HAL) | fast | 0.3955 | 0.3095 | 6.3 ms | 13.4 ms | 7.5 ms | **27.1 ms** |
 | **imx95-frdm** | | | | | | | |
-| `edgefirst` (HAL) | retina | 0.3966 | 0.3231 | 4.2 ms | 11.9 ms | 24.6 ms | **40.8 ms** |
-| `edgefirst` (HAL) | fast | 0.3966 | 0.3103 | 4.2 ms | 11.9 ms | 20.7 ms | **36.8 ms** |
+| `edgefirst` (HAL) | retina | 0.3966 | 0.3231 | 4.0 ms | 11.2 ms | 12.5 ms | **27.8 ms** |
+| `edgefirst` (HAL) | fast | 0.3966 | 0.3103 | 4.1 ms | 11.4 ms | 8.2 ms | **23.6 ms** |
 
 `Post` = NMS decode + mask materialisation. `End-to-end` = preprocess + inference + postprocess. RLE-encoding the binary masks is reported separately as output formatting (only relevant to validation, not deployment). The dvapi+numpy reference is omitted from the imx95 block because the dvproxy / `libaraclient` stack on that board needs intermittent restarts before each long run; the HAL path via `edgefirst-ara2` is unaffected.
 
@@ -57,8 +57,8 @@ The `Inf` column above is the wall-clock time `model.run()` takes — input-in, 
 | | DMA host→device | NPU compute | DMA device→host | Driver subtotal | Wall-clock roundtrip | Host overhead |
 |---|---:|---:|---:|---:|---:|---:|
 | `reference` (dvapi) on imx8mp | 2.17 ms | 4.40 ms | 4.66 ms | 11.23 ms | **17.94 ms** | 6.71 ms |
-| `edgefirst` (ara2-rs) on imx8mp | 2.24 ms | 4.40 ms | 4.93 ms | 11.57 ms | **13.68 ms** | 2.11 ms |
-| `edgefirst` (ara2-rs) on imx95 | 1.99 ms | 4.43 ms | 3.17 ms | 9.59 ms | **12.00 ms** | 2.41 ms |
+| `edgefirst` (ara2-rs) on imx8mp | 2.21 ms | 4.40 ms | 4.83 ms | 11.44 ms | **13.33 ms** | 1.89 ms |
+| `edgefirst` (ara2-rs) on imx95 | 1.96 ms | 4.39 ms | 2.96 ms | 9.31 ms | **11.22 ms** | 1.91 ms |
 
 The ~4.6 ms host-overhead delta between dvapi and edgefirst on imx8mp is the DMA-BUF benefit. The dvapi path moves the input tensor through a host buffer (numpy → libaraclient ctypes → dvproxy) and the output tensor back the same way; the edgefirst path uses `Tensor.from_fd` to wrap the dvproxy DMA-BUF directly, so the GPU letterbox writes the input DMA-BUF in place and HAL's Decoder reads the output DMA-BUF in place — the host never touches either buffer. The `HalPipeline` class is what wires this up; see its docstring for the construct-once / reuse-many invariants HAL Optimization Guide Rules 1, 4, and 5 require to keep the path zero-copy.
 
@@ -87,10 +87,10 @@ The numbers above measure *validation* mask cost: the validator calls HAL's `mat
 
 | Stage | imx8mp-frdm | imx95-frdm |
 |---|---:|---:|
-| preprocess (GPU) | 5.91 ms | 3.96 ms |
-| inference (wall) | 13.48 ms | 11.98 ms |
-| draw_masks (decode + materialize + render) | 21.97 ms | 21.55 ms |
-| **end-to-end (pre + inf + draw)** | **41.36 ms** | **37.50 ms** |
+| preprocess (GPU) | 5.85 ms | 3.66 ms |
+| inference (wall) | 13.28 ms | 11.28 ms |
+| draw_masks (decode + materialize + render) | 9.51 ms | 9.51 ms |
+| **end-to-end (pre + inf + draw)** | **28.65 ms** | **24.45 ms** |
 
 For the canonical live-pipeline pattern (camera → NPU → fused draw_masks → Wayland compositor) see [`ara2-rs/examples/yolov8_live.py`](https://github.com/EdgeFirstAI/ara2-rs/blob/main/examples/yolov8_live.py); for the API surface see HAL's `ImageProcessor.draw_masks` and `ImageProcessor.draw_decoded_masks`. The *EdgeFirst for i.MX Reference Manual* documents the full `edgefirstoverlay` per-stage timing methodology that this script mirrors.
 
@@ -100,11 +100,11 @@ The end-to-end numbers above come from a **serial** execution model: each stage 
 
 ![Serial pipeline timeline](assets/diagram_serial_execution.png)
 
-Drawn as a waterfall, the headroom becomes obvious: while any single stage runs, every other stage is idle. The GPU sits unused during NPU inference; the NPU sits unused during preprocess; the host sits unused during DMA transfers. NMS decode at 18 ms is the visible bottleneck — see the deployment-threshold caveat below.
+Drawn as a waterfall, the headroom becomes obvious: while any single stage runs, every other stage is idle. The GPU sits unused during NPU inference; the NPU sits unused during preprocess; the host sits unused during DMA transfers. Inference at 13 ms is now the bottleneck — NMS decode and mask materialisation together add 12.5 ms for retina, 7.5 ms for fast.
 
 ![Pipeline waterfall](assets/diagram_pipeline.waterfall.png)
 
-A throughput-tuned deployment can overlap stages across consecutive frames — start preprocessing frame *N+1* the moment frame *N*'s preprocess finishes, regardless of whether frame *N*'s NPU inference is still running. Once the pipeline is filled, the throughput *period* collapses from the **sum** of stages (40.8 ms here) to the **slowest single stage** (24.6 ms here, postprocess → 40.7 FPS).
+A throughput-tuned deployment can overlap stages across consecutive frames — start preprocessing frame *N+1* the moment frame *N*'s preprocess finishes, regardless of whether frame *N*'s NPU inference is still running. Once the pipeline is filled, the throughput *period* collapses from the **sum** of stages (27.8 ms here) to the **slowest single stage** (13.3 ms here, inference → 75.2 FPS).
 
 ![Concurrent pipeline](assets/diagram_pipeline_overlap.png)
 
@@ -130,7 +130,7 @@ pip install --upgrade pip
 pip install 'ara2-validator[hal] @ git+https://github.com/EdgeFirstAI/ara2-validator.git'
 ```
 
-The `[hal]` extra pulls [`edgefirst-hal>=0.18.2`](https://github.com/EdgeFirstAI/hal) and `edgefirst-ara2`. The `>=0.18.2` floor is required: 0.17.x ships a scalar `materialize_masks` (~569 ms / image at N=119 detections), 0.18.0 regressed rayon parallelism (PR #51), 0.18.1 restored it (~33 ms / image), and 0.18.2 adds further mask decoding optimizations (~9 ms / image on imx8mp-frdm retina).
+The `[hal]` extra pulls [`edgefirst-hal>=0.18.2`](https://github.com/EdgeFirstAI/hal) and `edgefirst-ara2`. The `>=0.18.2` floor is required: 0.17.x ships a scalar `materialize_masks` (~569 ms / image at N=119 detections), 0.18.0 regressed rayon parallelism (PR #51), 0.18.1 restored it (~33 ms / image), and 0.18.2 adds NMS decode and mask materialisation optimizations (~8 ms / image on imx8mp-frdm retina).
 
 ### Host (FP32 ONNX baseline)
 
@@ -170,6 +170,147 @@ python -m ara2_validator.edgefirst \
 ```
 
 This completes in about 40 s on imx8mp-frdm (warmup + 128 inferences + COCO evaluation). Add `--fast-masks` for the latency-tuned mask path.
+
+## Running validation benchmarks
+
+This section documents the full workflow for running coco128-seg validation on the target boards with a local HAL wheel build.
+
+### Board prerequisites
+
+| Board | SSH alias | Python | NPU service | Venv |
+|-------|-----------|--------|-------------|------|
+| imx8mp-frdm | `ssh imx8mp-frdm` | 3.13 | `ara2.service` | `/root/venv` (plain) |
+| imx95-frdm | `ssh imx95-frdm` | 3.13 | `ara2.service` | `/root/venv` (`--system-site-packages`) |
+
+Both boards must have the NPU service running (`systemctl is-active ara2.service` → `active`). The imx95-frdm frequently requires multiple reboots (3–5) to bring the NPU online due to PCIe link instability; if `ara2.service` shows `device handle error`, reboot and retry.
+
+### Deploying a local HAL wheel
+
+The validator cannot be `pip install`-ed directly on-target (setuptools flat-layout error from the `assets/` directory). Instead, rsync the code and install the HAL wheel separately:
+
+```bash
+# Sync validator source to both boards
+rsync -a --delete --exclude='*.pyc' --exclude='__pycache__' \
+    ara2_validator/ imx8mp-frdm:/root/ara2-validator/ara2_validator/
+rsync -a --delete --exclude='*.pyc' --exclude='__pycache__' \
+    ara2_validator/ imx95-frdm:/root/ara2-validator/ara2_validator/
+
+# Deploy HAL wheel (cp38-abi3 is compatible with Python 3.8+)
+HAL_WHEEL=~/software/hal/target/wheels/edgefirst_hal-0.18.1-cp38-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl
+
+scp "$HAL_WHEEL" imx8mp-frdm:/tmp/
+ssh imx8mp-frdm '/root/venv/bin/pip install --force-reinstall --no-deps --no-cache-dir /tmp/edgefirst_hal-*.whl'
+
+scp "$HAL_WHEEL" imx95-frdm:/tmp/
+ssh imx95-frdm '/root/venv/bin/pip install --force-reinstall --no-deps --no-cache-dir /tmp/edgefirst_hal-*.whl'
+```
+
+> [!WARNING]
+> The imx95-frdm venv uses `--system-site-packages`. If an older HAL version is installed system-wide at `/usr/lib/python3.13/site-packages/edgefirst_hal/`, Python will prefer a version-specific `.cpython-313-*.so` over the venv's `.abi3.so`. Remove any system-wide copy before benchmarking:
+> ```bash
+> ssh imx95-frdm 'rm -rf /usr/lib/python3.13/site-packages/edgefirst_hal*'
+> ```
+
+### Verifying the installed wheel
+
+```bash
+# Confirm the correct .so is loaded from the venv
+ssh imx8mp-frdm '/root/venv/bin/python3 -c "import edgefirst_hal; print(edgefirst_hal.__file__)"'
+# Expected: /root/venv/lib/python3.13/site-packages/edgefirst_hal/__init__.py
+
+# Compare installed .so against wheel contents
+ssh imx95-frdm 'md5sum /root/venv/lib/python3.13/site-packages/edgefirst_hal/edgefirst_hal.abi3.so'
+```
+
+### Running the 4 benchmark configurations
+
+All runs use `PYTHONPATH` to pick up the rsynced validator code:
+
+```bash
+# imx8mp retina (full-resolution masks)
+ssh imx8mp-frdm 'cd /root/ara2-validator && PYTHONPATH=/root/ara2-validator \
+    /root/venv/bin/python3 -m ara2_validator.edgefirst \
+    --model /root/yolov8n-seg-kinara-1.2.1.dvm \
+    --images /root/coco128/images/ \
+    --gt /root/coco128/annotations/instances_train2017.json \
+    --with-masks'
+
+# imx8mp fast (proto-resolution masks)
+ssh imx8mp-frdm 'cd /root/ara2-validator && PYTHONPATH=/root/ara2-validator \
+    /root/venv/bin/python3 -m ara2_validator.edgefirst \
+    --model /root/yolov8n-seg-kinara-1.2.1.dvm \
+    --images /root/coco128/images/ \
+    --gt /root/coco128/annotations/instances_train2017.json \
+    --with-masks --fast-masks'
+
+# imx95 retina
+ssh imx95-frdm 'cd /root/ara2-validator && PYTHONPATH=/root/ara2-validator \
+    /root/venv/bin/python3 -m ara2_validator.edgefirst \
+    --model /root/yolov8n-seg-kinara-1.2.1.dvm \
+    --images /root/coco128/images/ \
+    --gt /root/coco128/annotations/instances_train2017.json \
+    --with-masks'
+
+# imx95 fast
+ssh imx95-frdm 'cd /root/ara2-validator && PYTHONPATH=/root/ara2-validator \
+    /root/venv/bin/python3 -m ara2_validator.edgefirst \
+    --model /root/yolov8n-seg-kinara-1.2.1.dvm \
+    --images /root/coco128/images/ \
+    --gt /root/coco128/annotations/instances_train2017.json \
+    --with-masks --fast-masks'
+```
+
+### Running the deployment-style benchmark
+
+The fused `draw_masks` benchmark uses a deployment score threshold (`0.5`) and measures the path a live pipeline takes:
+
+```bash
+ssh imx8mp-frdm 'cd /root/ara2-validator && PYTHONPATH=/root/ara2-validator \
+    /root/venv/bin/python3 -m tests.bench_draw_masks \
+    --model /root/yolov8n-seg-kinara-1.2.1.dvm \
+    --images /root/coco128/images/ \
+    --score-threshold 0.5'
+
+ssh imx95-frdm 'cd /root/ara2-validator && PYTHONPATH=/root/ara2-validator \
+    /root/venv/bin/python3 -m tests.bench_draw_masks \
+    --model /root/yolov8n-seg-kinara-1.2.1.dvm \
+    --images /root/coco128/images/ \
+    --score-threshold 0.5'
+```
+
+### Interpreting output
+
+Each run prints a timing table:
+
+```
+Stage                               Mean      Min      Max  ms
+preprocess (GPU)                    4.20     3.56     5.20
+inference (wall)                   11.92    11.67    12.37
+  dma input (host→device)             1.98     1.95     2.10
+  dma output (device→host)            3.15     3.05     3.27
+postprocess (nms+mask)             24.64    19.93    31.84
+  nms_decode (HAL)                   18.43    16.39    20.54
+  materialize_hal                     6.22     2.84    13.61
+  Model-path (pre+inf+post, excl. output): 40.77 ms (24.6 FPS)
+```
+
+Key metrics to compare:
+- **nms_decode** — NMS + dequantisation in compiled Rust
+- **materialize_hal** — mask materialisation (retina ~6–9 ms, fast ~2–3 ms)
+- **Model-path** — end-to-end excluding output formatting (the number reported in the timing table above)
+
+Accuracy is reported below the timing table as Box mAP@0.50:0.95 and Mask mAP@0.50:0.95.
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| `HardwareError: Ara2 error: 520` | NPU not ready. Run `systemctl restart ara2.service`, wait 20s. If it fails, reboot. |
+| `ara2.service` stuck in `activating` | Reboot the board. imx95 may need 3–5 reboots. |
+| Inference wall time >20 ms on imx95 | PCIe/thermal issue. Reboot for clean DMA state. |
+| `ModuleNotFoundError: edgefirst_ara2` | On imx95: venv must use `--system-site-packages` (edgefirst-ara2 is system-installed). |
+| Wrong .so loaded (stale results) | Remove system-wide copy: `rm -rf /usr/lib/python3.13/site-packages/edgefirst_hal*` |
+| `pip install` of validator fails with flat-layout error | Use the rsync + PYTHONPATH workflow above instead. |
 
 ## Architecture
 
@@ -243,7 +384,7 @@ Each script defaults to the **retina** mask path — Ultralytics `ops.process_ma
 
 The `--fast-masks` flag is an opt-in to a lower-latency path:
 
-- **`edgefirst`** — `MaskResolution.Proto` returns continuous-sigmoid u8 tiles at proto resolution and the caller upsamples each tile via `cv2.resize`. About 1.5× faster end-to-end on imx8mp-frdm, ~0.8 pp lower mask mAP.
+- **`edgefirst`** — `MaskResolution.Proto` returns continuous-sigmoid u8 tiles at proto resolution and the caller upsamples each tile via `cv2.resize`. About 12% faster end-to-end on imx8mp-frdm, ~1.2 pp lower mask mAP.
 - **`reference` and `onnx_reference`** — Ultralytics `ops.process_mask()`: threshold logits at proto resolution, bilinear-upsample the binary mask, re-threshold. Same speed as retina on these stacks (per-detection upsample dominates either way), ~0.6 pp lower mask mAP.
 
 ## Usage
@@ -350,7 +491,7 @@ int8 quantisation produces protos that are near-identical but not bit-identical 
 
 ### `edgefirst`
 
-- `edgefirst-hal>=0.18.2` — GPU-accelerated preprocessing and postprocessing (the floor is required: 0.17.x ships a scalar `materialize_masks` ~17× slower; 0.18.0 dropped the rayon parallelism the kernel needs; 0.18.1 restored it; 0.18.2 adds further mask decoding optimizations)
+- `edgefirst-hal>=0.18.2` — GPU-accelerated preprocessing and postprocessing (the floor is required: 0.17.x ships a scalar `materialize_masks` ~75× slower; 0.18.0 dropped the rayon parallelism the kernel needs; 0.18.1 restored it; 0.18.2 adds NMS decode and mask materialisation optimizations)
 - `edgefirst-ara2` — Rust/pyo3 wrapper around libaraclient with DMA-BUF tensor mapping
 - Same `dvproxy` + `libaraclient.so` requirements as `reference`
 
