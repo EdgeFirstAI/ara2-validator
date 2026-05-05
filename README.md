@@ -35,20 +35,20 @@ The full COCO val2017 set. Drift columns are absolute **percentage points** (`mA
 
 All scripts run on-target so the per-stage timings are directly comparable. Top block is imx8mp-frdm; bottom block is imx95-frdm.
 
-| Script | Mask | Box mAP | Mask mAP | Pre | Inf | Post (nms+mask) | End-to-end |
-|---|---|---:|---:|---:|---:|---:|---:|
-| **imx8mp-frdm** | | | | | | | |
-| `onnx_reference` (FP32, on-target CPU) | retina | **0.4533** | **0.3444** | 1.7 ms | 46.3 ms | 47.6 ms | 95.7 ms |
-| `onnx_reference` (FP32, on-target CPU) | fast | 0.4533 | 0.3337 | 1.8 ms | 44.6 ms | 47.8 ms | 94.1 ms |
-| `reference` (dvapi+numpy) | retina | 0.3941 | 0.3278 | 21.1 ms | 18.0 ms | 412.9 ms | 452.2 ms |
-| `reference` (dvapi+numpy) | fast | 0.3941 | 0.3221 | 20.6 ms | 18.2 ms | 293.4 ms | 332.3 ms |
-| `edgefirst` (HAL) | retina | 0.3955 | 0.3218 | 6.2 ms | 13.3 ms | 12.5 ms | **32.1 ms** |
-| `edgefirst` (HAL) | fast | 0.3955 | 0.3095 | 6.3 ms | 13.4 ms | 7.5 ms | **27.1 ms** |
-| **imx95-frdm** | | | | | | | |
-| `edgefirst` (HAL) | retina | 0.3966 | 0.3231 | 4.0 ms | 11.2 ms | 12.5 ms | **27.8 ms** |
-| `edgefirst` (HAL) | fast | 0.3966 | 0.3103 | 4.1 ms | 11.4 ms | 8.2 ms | **23.6 ms** |
+| Script | Mask | Box mAP | Mask mAP | Pre | Inf | NMS | Mask | End-to-end |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| **imx8mp-frdm** | | | | | | | | |
+| `onnx_reference` (FP32, on-target CPU) | retina | **0.4533** | **0.3444** | 1.7 ms | 46.3 ms | — | 47.6 ms | 95.7 ms |
+| `onnx_reference` (FP32, on-target CPU) | fast | 0.4533 | 0.3337 | 1.8 ms | 44.6 ms | — | 47.8 ms | 94.1 ms |
+| `reference` (dvapi+numpy) | retina | 0.3941 | 0.3278 | 21.1 ms | 18.0 ms | — | 412.9 ms | 452.2 ms |
+| `reference` (dvapi+numpy) | fast | 0.3941 | 0.3221 | 20.6 ms | 18.2 ms | — | 293.4 ms | 332.3 ms |
+| `edgefirst` (HAL) | retina | 0.3955 | 0.3218 | 6.2 ms | 13.3 ms | 5.1 ms | 7.4 ms | **32.1 ms** |
+| `edgefirst` (HAL) | fast | 0.3955 | 0.3095 | 6.3 ms | 13.4 ms | 5.1 ms | 2.4 ms | **27.1 ms** |
+| **imx95-frdm** | | | | | | | | |
+| `edgefirst` (HAL) | retina | 0.3966 | 0.3231 | 4.0 ms | 11.2 ms | 5.9 ms | 6.6 ms | **27.8 ms** |
+| `edgefirst` (HAL) | fast | 0.3966 | 0.3103 | 4.1 ms | 11.4 ms | 6.0 ms | 2.2 ms | **23.6 ms** |
 
-`Post` = NMS decode + mask materialisation. `End-to-end` = preprocess + inference + postprocess. RLE-encoding the binary masks is reported separately as output formatting (only relevant to validation, not deployment). The dvapi+numpy reference is omitted from the imx95 block because the dvproxy / `libaraclient` stack on that board needs intermittent restarts before each long run; the HAL path via `edgefirst-ara2` is unaffected.
+`NMS` = HAL nms_decode (dequantisation, top-K filtering, box decode, NMS). `Mask` = mask materialisation (proto matmul, sigmoid, crop, resize). `End-to-end` = Pre + Inf + NMS + Mask. RLE-encoding the binary masks is reported separately as output formatting (only relevant to validation, not deployment). The dvapi+numpy reference is omitted from the imx95 block because the dvproxy / `libaraclient` stack on that board needs intermittent restarts before each long run; the HAL path via `edgefirst-ara2` is unaffected. The `reference` and `onnx_reference` rows don't split NMS from Mask because Ultralytics performs both in a single fused `postprocess()` call.
 
 #### NPU inference breakdown
 
@@ -100,11 +100,11 @@ The end-to-end numbers above come from a **serial** execution model: each stage 
 
 ![Serial pipeline timeline](assets/diagram_serial_execution.png)
 
-Drawn as a waterfall, the headroom becomes obvious: while any single stage runs, every other stage is idle. The GPU sits unused during NPU inference; the NPU sits unused during preprocess; the host sits unused during DMA transfers. Inference at 13 ms is now the bottleneck — NMS decode and mask materialisation together add 12.5 ms for retina, 7.5 ms for fast.
+Drawn as a waterfall, the headroom becomes obvious: while any single stage runs, every other stage is idle. The GPU sits unused during NPU inference; the NPU sits unused during preprocess; the host sits unused during DMA transfers. With the NMS/Mask split visible, inference at 13 ms is the longest single stage; NMS (5 ms) and Mask (7 ms) are independent of the GPU and NPU and could overlap with the next frame's preprocess or inference in a pipelined deployment.
 
 ![Pipeline waterfall](assets/diagram_pipeline.waterfall.png)
 
-A throughput-tuned deployment can overlap stages across consecutive frames — start preprocessing frame *N+1* the moment frame *N*'s preprocess finishes, regardless of whether frame *N*'s NPU inference is still running. Once the pipeline is filled, the throughput *period* collapses from the **sum** of stages (27.8 ms here) to the **slowest single stage** (13.3 ms here, inference → 75.2 FPS).
+A throughput-tuned deployment can overlap stages across consecutive frames — start preprocessing frame *N+1* the moment frame *N*'s preprocess finishes, regardless of whether frame *N*'s NPU inference is still running. With four pipeline stages (Pre 6 ms | Inf 13 ms | NMS 5 ms | Mask 7 ms), once the pipeline is filled the throughput *period* collapses to the **slowest single stage** (13.3 ms, inference → 75 FPS). NMS and Mask together (12.5 ms) fit inside the inference window, so they are fully hidden in the concurrent case.
 
 ![Concurrent pipeline](assets/diagram_pipeline_overlap.png)
 
