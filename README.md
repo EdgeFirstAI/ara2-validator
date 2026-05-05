@@ -87,31 +87,42 @@ The ~4.6 ms host-overhead delta between dvapi and edgefirst on imx8mp is the DMA
 
 The `Decode` and `Mask` columns in the timing tables represent the two phases of post-processing after NPU inference completes. Both operate entirely on the CPU (Cortex-A53 on imx8mp, Cortex-A55 on imx95) against the NPU output DMA-BUF.
 
-**Decode** (`nms_decode` in HAL) transforms the raw quantized NPU output grid into a filtered list of detections:
+All sub-step timings below were measured on the **imx95-frdm** (Cortex-A55 @ 1.8 GHz)
+using HAL's built-in Perfetto tracing instrumentation (`hal.Tracing()` context manager).
 
-| Sub-step | What it does | Cost driver |
-|----------|-------------|-------------|
-| Score dequantisation | Dequantize 8400×80 int8 score grid, find per-anchor class argmax | Fixed: 8400 anchors × 80 classes (NEON vectorised argmax) |
-| Score threshold filter | Reject anchors below confidence threshold | Fixed scan of 8400 scores |
-| Top-K pre-filter | Keep only the top 300 highest-scoring candidates (O(N) partial sort) | Threshold-dependent: at 0.001 typically 100–300 survive; at 0.5 only 2–5 |
-| Box dequantisation + decode | Dequantize int8 box coords for surviving candidates, apply stride grid, convert center→corner format | Linear in surviving candidates |
-| Class-aware NMS | Per-class IoU suppression (greedy, threshold 0.7) | Quadratic in per-class candidates (dominated by top-K cap) |
-| Proto extraction | Copy 819 KB prototype tensor from DMA-BUF (32 channels × 160×160) in native NCHW layout — no transpose | Fixed 0.4 ms memcpy (skipped entirely if 0 detections via lazy extraction) |
+**Decode** (`decode` in HAL) transforms the raw quantized NPU output grid into a filtered list of detections:
 
-Typical decode cost: **2.1–2.6 ms** depending on threshold and number of surviving candidates.
+| Sub-step | What it does | Time (0.5 thr) | Time (0.001 thr) |
+|----------|-------------|:--------------:|:-----------------:|
+| Score filter + argmax | Dequantize 8400×80 int8 score grid, find per-anchor class argmax, threshold filter | 0.81 ms | 0.86 ms |
+| Top-K pre-filter | Keep top 300 highest-scoring candidates (O(N) partial sort) | 0.009 ms | 0.014 ms |
+| Class-aware NMS | Per-class IoU suppression (greedy, threshold 0.7) | 0.009 ms | 0.109 ms |
+| Box dequantisation | Dequantize int8 box coords for surviving candidates | 0.002 ms | 0.003 ms |
+| Proto extraction | Copy mask coefficients + 819 KB proto tensor (NCHW, no transpose) | 0.72 ms | 0.95 ms |
+| **Total decode** | | **1.65 ms** | **2.05 ms** |
+
+The score filter dominates decode cost — it must scan all 8400 anchors × 80 classes regardless of threshold. NMS cost scales quadratically in per-class survivors but is negligible when top-K caps candidates at 300.
 
 **Mask Materialize** (`materialize_masks` in HAL) produces per-detection binary masks from the prototype tensor and per-detection mask coefficients:
 
 | Sub-step | What it does | Cost driver |
 |----------|-------------|-------------|
-| Proto matmul | For each detection: dot product of 32 mask coefficients × 32-channel prototype at each spatial position (160×160) | Linear in detections × 25,600 spatial positions |
-| Sigmoid activation | Apply σ(x) to the accumulated logits at each spatial position | Linear in detections × spatial resolution |
-| Crop to bbox | Zero out mask pixels outside the detection's bounding box | Negligible |
-| Resize to original | Bilinear upscale from 160×160 ROI to original image coordinates (**retina** mode) or skip (**fast** mode) | Dominates retina cost; proportional to output mask area |
+| Proto matmul | For each detection: dot product of 32 mask coefficients × 32-channel prototype at each output pixel | Linear in detections × output resolution |
+| Sigmoid + crop | Apply σ(x), zero pixels outside detection bbox | Negligible |
+| Bilinear resize | Upscale from 160×160 ROI to output dimensions (**scaled** mode only) | Proportional to output mask area |
 
-The matmul is the heaviest operation: for each detection, the NCHW kernel iterates over 32 channels, broadcasting each coefficient across the 160×160 spatial plane and accumulating. At the validation threshold (~5–15 detections survive NMS), this results in 5–15 × 32 × 25,600 = 4–15M multiply-accumulate operations. At the deployment threshold (~2–5 detections), cost drops proportionally.
+Measured mask timings (imx95-frdm, **scaled** mode, 0.5 threshold):
+- 1 detection: **1.0–2.6 ms** (median 2.6 ms)
+- 2 detections: **1.8–5.2 ms** (median 2.4 ms)
+- 4 detections: **5.3 ms**
 
-Typical mask cost: **retina 3.3–9.7 ms** (scales with detection count and output resolution), **fast 1.5–3.8 ms** (no final resize).
+At validation threshold (0.001, ~5–15 detections): mean **7.8 ms**, max **19.6 ms**.
+At deployment threshold (0.5, ~1–4 detections): mean **3.7 ms**, max **8.7 ms**.
+
+> **Measurement method**: Sub-step times captured using HAL's built-in Perfetto
+> tracing (`hal.Tracing()` context manager) which writes Chrome JSON trace files
+> viewable at [ui.perfetto.dev](https://ui.perfetto.dev/). Tracing adds < 1%
+> overhead (single atomic load per span site when no subscriber is active).
 
 ### What "end-to-end" measures
 
