@@ -221,11 +221,11 @@ def _run_hal(args, image_paths: list[str], spec, model) -> list[dict]:
 
 
 def _run_numpy(args, image_paths: list[str], spec, model) -> list[dict]:
-    """NumPy backend: CPU preprocess + numpy postprocess (baseline)."""
+    """OpenCV backend: CPU preprocess + opencv postprocess (baseline)."""
     from .model import _strip_trailing_ones
-    from .postprocess_numpy import (
+    from .postprocess_opencv import (
         decode_masks, decode_masks_retina,
-        postprocess_numpy, unletterbox_boxes, unletterbox_masks,
+        postprocess_opencv, unletterbox_boxes, unletterbox_masks,
     )
     from .preprocess import LetterboxInfo, letterbox
 
@@ -308,7 +308,7 @@ def _run_numpy(args, image_paths: list[str], spec, model) -> list[dict]:
 
         # 4. CPU postprocess (decode + NMS + masks)
         t0 = time.perf_counter()
-        boxes_np, scores_np, classes_np, mask_logits = postprocess_numpy(
+        boxes_np, scores_np, classes_np, mask_logits = postprocess_opencv(
             outputs, input_h, input_w,
             args.score_threshold, args.iou_threshold,
             args.max_detections, with_masks=not args.no_masks,

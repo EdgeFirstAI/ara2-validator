@@ -1,11 +1,11 @@
 # Ara240 Validator
 
-> **YOLOv8-seg COCO validation on the NXP Ara240 NPU, end-to-end.** Three reference inference paths (FP32 ONNX host, dvapi+numpy on-target, EdgeFirst HAL on-target) producing pycocotools-evaluated COCO JSON, with per-stage timings on each.
+> **YOLOv8-seg COCO validation on the NXP Ara240 NPU, end-to-end.** Three reference inference paths (FP32 ONNX host, dvapi+opencv on-target, EdgeFirst HAL on-target) producing pycocotools-evaluated COCO JSON, with per-stage timings on each.
 
 | | What it shows | Where it runs |
 |---|---|---|
 | **`onnx_reference`** | FP32 ONNX accuracy ceiling | any CPU/CUDA host, or on-target |
-| **`reference`** | int8 NPU baseline using NXP dvapi.py | imx8mp-frdm, imx95-frdm |
+| **`reference`** | int8 NPU baseline using NXP dvapi.py + OpenCV | imx8mp-frdm, imx95-frdm |
 | **`edgefirst`** | int8 NPU + GPU letterbox + HAL Decoder | imx8mp-frdm, imx95-frdm |
 
 This validator augments the NXP-supplied dvapi reference with EdgeFirst HAL acceleration: GPU letterbox preprocessing rendered directly into the NPU input buffer, detection decode and mask materialisation in compiled Rust, all sharing the dvproxy DMA-BUF surface for zero-copy data movement. It is an **offline benchmarking + validation tool**, not a production streaming application — each pipeline stage runs serially so per-stage cost is captured cleanly. For live camera/video inference with EdgeFirst, see the [ara2-rs examples](https://github.com/EdgeFirstAI/ara2-rs/tree/main/examples).
@@ -48,11 +48,13 @@ All scripts run on-target so the per-stage timings are directly comparable. Two 
 | **imx8mp-frdm** | | | | | | | | |
 | `onnx_reference` (FP32, on-target CPU) | retina | **0.4533** | **0.3444** | 1.7 ms | 46.3 ms | — | 47.6 ms | 95.7 ms |
 | `onnx_reference` (FP32, on-target CPU) | fast | 0.4533 | 0.3337 | 1.8 ms | 44.6 ms | — | 47.8 ms | 94.1 ms |
-| `reference` (dvapi+numpy) | retina | 0.3941 | 0.3278 | 21.1 ms | 18.0 ms | — | 412.9 ms | 452.2 ms |
-| `reference` (dvapi+numpy) | fast | 0.3941 | 0.3221 | 20.6 ms | 18.2 ms | — | 293.4 ms | 332.3 ms |
+| `reference` (dvapi+opencv) | retina | 0.3941 | 0.3278 | 24 ms | 18 ms | 32 ms | 265 ms | 339 ms |
+| `reference` (dvapi+opencv) | fast | 0.3941 | 0.3221 | 21 ms | 18 ms | 33 ms | 179 ms | 251 ms |
 | `edgefirst` (HAL) | retina | 0.3955 | 0.3218 | 6.2 ms | 13.5 ms | 2.6 ms | 9.7 ms | **32.0 ms** |
 | `edgefirst` (HAL) | fast | 0.3955 | 0.3095 | 6.2 ms | 13.5 ms | 2.6 ms | 3.8 ms | **26.1 ms** |
 | **imx95-frdm** | | | | | | | | |
+| `reference` (dvapi+opencv) | retina | 0.3941 | 0.3278 | 20 ms | 16 ms | 32 ms | 172 ms | 240 ms |
+| `reference` (dvapi+opencv) | fast | 0.3941 | 0.3221 | 17 ms | 16 ms | 31 ms | 193 ms | 257 ms |
 | `edgefirst` (HAL) | retina | 0.3966 | 0.3231 | 4.1 ms | 11.3 ms | 2.6 ms | 7.6 ms | **25.5 ms** |
 | `edgefirst` (HAL) | fast | 0.3966 | 0.3103 | 4.1 ms | 11.3 ms | 2.5 ms | 2.9 ms | **20.8 ms** |
 
@@ -69,7 +71,7 @@ All scripts run on-target so the per-stage timings are directly comparable. Two 
 
 The `0.5` threshold reduces mAP by ~30% (0.40 → 0.28 Box, 0.32 → 0.24 Mask) because pycocotools can no longer integrate the full precision-recall curve — high-recall operating points are unreachable when low-confidence true positives are discarded before submission. This is an evaluation artefact, not a model quality difference: the model's actual detection capability is unchanged, only the evaluator's ability to measure it is truncated.
 
-`Decode` = HAL `nms_decode` (dequantisation, top-K filtering, box decode, class-aware NMS, proto extraction). `Mask` = mask materialisation (proto matmul, sigmoid, crop, resize). `End-to-end` = Pre + Inf + Decode + Mask. The `reference` and `onnx_reference` rows don't split Decode from Mask because Ultralytics performs both in a single fused `postprocess()` call. The dvapi+numpy reference is omitted from the imx95 block because the dvproxy / `libaraclient` stack on that board needs intermittent restarts.
+`Decode` = HAL `nms_decode` (dequantisation, top-K filtering, box decode, class-aware NMS, proto extraction). `Mask` = mask materialisation (proto matmul, sigmoid, crop, resize). `End-to-end` = Pre + Inf + Decode + Mask. For the `reference` path, `Decode` = `cv2.dnn.NMSBoxes` (compiled C++ NMS) plus NumPy dequantisation and proto matmul; `Mask` = per-detection `cv2.resize` bilinear upsample + crop + threshold. The `onnx_reference` rows don't split Decode from Mask because Ultralytics performs both in a single fused `postprocess()` call.
 
 #### NPU inference breakdown
 
@@ -320,6 +322,39 @@ ssh imx95-frdm 'cd /root/ara2-validator && PYTHONPATH=/root/ara2-validator \
     --with-masks --fast-masks'
 ```
 
+### Running the reference (dvapi+opencv) baseline
+
+The reference path uses NXP's `dvapi.py` for inference with OpenCV/NumPy postprocessing (`cv2.dnn.NMSBoxes` for NMS, `cv2.resize` for mask decode). No EdgeFirst HAL is required — this demonstrates the baseline without accelerated postprocessing:
+
+```bash
+# imx8mp reference retina
+ssh imx8mp-frdm 'cd /root/ara2-validator && PYTHONPATH=/root/ara2-validator \
+    /root/venv/bin/python3 -m ara2_validator.reference \
+    --model /root/yolov8n-seg-kinara-1.2.1.dvm \
+    --images /root/coco128/images/ \
+    --gt /root/coco128/annotations/instances_train2017.json \
+    --with-masks --warmup 1'
+
+# imx8mp reference fast
+ssh imx8mp-frdm 'cd /root/ara2-validator && PYTHONPATH=/root/ara2-validator \
+    /root/venv/bin/python3 -m ara2_validator.reference \
+    --model /root/yolov8n-seg-kinara-1.2.1.dvm \
+    --images /root/coco128/images/ \
+    --gt /root/coco128/annotations/instances_train2017.json \
+    --with-masks --fast-masks --warmup 1'
+
+# imx95 reference retina
+ssh imx95-frdm 'cd /root/ara2-validator && PYTHONPATH=/root/ara2-validator \
+    /root/venv/bin/python3 -m ara2_validator.reference \
+    --model /root/yolov8n-seg-kinara-1.2.1.dvm \
+    --images /root/coco128/images/ \
+    --gt /root/coco128/annotations/instances_train2017.json \
+    --with-masks --warmup 1'
+```
+
+> [!NOTE]
+> The `reference` path uses NXP's `libaraclient_aarch64.so` via Python ctypes which has a known heap corruption issue (`double free or corruption`) after 50–100+ sequential inferences. If the run aborts, restart `ara2.service` and re-run; timing data from partial runs is still valid for per-image statistics.
+
 ### Running the deployment-style benchmark
 
 The fused `draw_masks` benchmark uses a deployment score threshold (`0.5`) and measures the path a live pipeline takes:
@@ -390,7 +425,7 @@ flowchart TD
     subgraph dvapi_path[dvapi reference — on-target]
         D1[cv2 letterbox<br/>+ int8 quantize]:::cpu
         D2[dvapi.py → libaraclient<br/>via /var/run/ara2.sock]:::npu
-        D3[numpy NMS + dequant<br/>retina mask decode]:::cpu
+        D3[cv2.dnn.NMSBoxes + dequant<br/>cv2.resize mask decode]:::cpu
     end
 
     subgraph hal_path[EdgeFirst HAL — on-target]
@@ -565,7 +600,7 @@ ara2_validator/
 ├── edgefirst.py         # EdgeFirst HAL — canonical HAL entry point
 ├── hal_pipeline.py      # HalPipeline class — copy-paste-ready HAL setup
 ├── postprocess_hal.py   # MaskMode enum + materialize_masks_for_coco_*
-├── postprocess_numpy.py # NumPy decode: dequant → boxes → NMS → masks
+├── postprocess_opencv.py # OpenCV decode: dequant → boxes → NMS → masks
 ├── preprocess.py        # Letterbox resize, quantise, HalPreprocessor
 ├── nms.py               # Pure numpy NMS (class-aware, Ultralytics algorithm)
 ├── coco_output.py       # COCO JSON serialisation with RLE masks

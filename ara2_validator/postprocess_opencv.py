@@ -4,9 +4,17 @@ Handles the full decode pipeline:
   1. Dequantize each tensor (done upstream in model.run_inference)
   2. Reshape to [N, features] layout
   3. Convert boxes from xcycwh → xyxy pixel coordinates
-  4. Apply class-aware NMS
-  5. Decode instance segmentation masks via prototype matmul
+  4. Apply class-aware NMS (cv2.dnn.NMSBoxes — compiled C++)
+  5. Decode instance segmentation masks via prototype matmul (numpy)
   6. Crop and threshold masks to bounding boxes
+  7. Upsample masks to original resolution (cv2.resize — compiled C++)
+
+This mirrors the Hailo RPi5 official reference implementation pattern:
+  - cv2.dnn.NMSBoxes for compiled NMS (vs. Cython NMS on Hailo)
+  - numpy matmul for proto × coeff
+  - cv2.resize for mask upsampling (same as Hailo)
+
+No torch/torchvision dependency. Only numpy + opencv-python.
 
 Box coordinate flow:
   Model output → xcycwh in 640×640 letterboxed space → xyxy → NMS
@@ -18,7 +26,6 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from .nms import nms_with_masks, nms_class_aware
 from .preprocess import LetterboxInfo
 
 
@@ -29,7 +36,7 @@ def xcycwh_to_xyxy(boxes: np.ndarray) -> np.ndarray:
     return np.concatenate([xy - wh / 2, xy + wh / 2], axis=1)
 
 
-def postprocess_numpy(
+def postprocess_opencv(
     outputs: dict[str, np.ndarray],
     input_h: int,
     input_w: int,
@@ -117,23 +124,56 @@ def postprocess_numpy(
             mc = mc.T                    # [N, 32]
         mask_coeffs = mc
 
-    # --- NMS ---
-    if mask_coeffs is not None:
-        boxes_nms, scores_nms, classes_nms, mc_nms = nms_with_masks(
-            boxes_xyxy, scores_raw, mask_coeffs,
-            iou_threshold=iou_threshold,
-            score_threshold=score_threshold,
-            max_detections=max_detections,
-            class_aware=True,
-        )
+    # --- NMS via cv2.dnn.NMSBoxes (compiled C++) ---
+    # Class-aware NMS using the Ultralytics offset trick: shift each box
+    # spatially by class_id * max_wh so boxes from different classes never
+    # overlap. Then a single NMS pass handles all classes at once.
+    # This matches Ultralytics nms.py:143:
+    #   c = x[:, 5:6] * (0 if agnostic else max_wh)
+    #   boxes = x[:, :4] + c; i = torchvision.ops.nms(boxes, scores, iou_thres)
+    max_wh = 7680
+    class_ids = scores_raw.argmax(axis=1)
+    confs = scores_raw[np.arange(len(scores_raw)), class_ids]
+
+    # Score pre-filter (avoids feeding 8400 boxes to NMS)
+    keep = confs >= score_threshold
+    boxes_f = boxes_xyxy[keep]
+    confs_f = confs[keep]
+    class_ids_f = class_ids[keep]
+    mc_f = mask_coeffs[keep] if mask_coeffs is not None else None
+
+    if len(boxes_f) == 0:
+        boxes_nms = np.empty((0, 4), dtype=np.float32)
+        scores_nms = np.empty(0, dtype=np.float32)
+        classes_nms = np.empty(0, dtype=np.intp)
+        mc_nms = (np.empty((0, mask_coeffs.shape[1]), dtype=np.float32)
+                  if mask_coeffs is not None else None)
     else:
-        boxes_nms, scores_nms, classes_nms, _ = nms_class_aware(
-            boxes_xyxy, scores_raw,
-            iou_threshold=iou_threshold,
-            score_threshold=score_threshold,
-            max_detections=max_detections,
+        # Offset boxes by class for class-aware NMS
+        offsets = class_ids_f[:, None].astype(np.float32) * max_wh
+        boxes_offset = boxes_f + offsets
+
+        # cv2.dnn.NMSBoxes expects [x, y, w, h] (top-left corner + size)
+        xywh = np.empty_like(boxes_offset, dtype=np.float32)
+        xywh[:, 0] = boxes_offset[:, 0]          # x (top-left)
+        xywh[:, 1] = boxes_offset[:, 1]          # y (top-left)
+        xywh[:, 2] = boxes_offset[:, 2] - boxes_offset[:, 0]  # width
+        xywh[:, 3] = boxes_offset[:, 3] - boxes_offset[:, 1]  # height
+
+        indices = cv2.dnn.NMSBoxes(
+            xywh, confs_f.astype(np.float32),
+            score_threshold, iou_threshold,
+            top_k=min(30000, len(confs_f)),
         )
-        mc_nms = None
+        if indices is not None and len(indices) > 0:
+            indices = np.asarray(indices).flatten()[:max_detections]
+        else:
+            indices = np.empty(0, dtype=np.intp)
+
+        boxes_nms = boxes_f[indices]
+        scores_nms = confs_f[indices]
+        classes_nms = class_ids_f[indices]
+        mc_nms = mc_f[indices] if mc_f is not None else None
 
     # --- Compute mask logits (if masks requested) ---
     mask_logits = None

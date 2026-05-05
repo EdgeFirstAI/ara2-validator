@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Reference YOLOv8-seg inference on Ara240 using NXP dvapi + numpy/OpenCV.
+"""Reference YOLOv8-seg inference on Ara240 using NXP dvapi + NumPy/OpenCV.
 
 This script is a self-contained reference implementation that demonstrates
-how to run a YOLOv8-seg DVM model on the NXP Ara240 NPU using only:
+how to run a YOLOv8-seg DVM model on the NXP Ara240 NPU using:
   - NXP's dvapi.py (ctypes wrapper around libaraclient)
-  - OpenCV for image loading/letterbox resize
-  - NumPy for quantization, dequantization, NMS, and mask decode
+  - OpenCV for image loading/letterbox resize, NMS (cv2.dnn.NMSBoxes),
+    and mask upsampling (cv2.resize)
+  - NumPy for quantization/dequantization and proto×coeff matmul
 
-No EdgeFirst tooling is required. The preprocessing and postprocessing
-steps are documented inline with references to the equivalent Ultralytics
-code paths for comparison.
+No EdgeFirst tooling or PyTorch is required. The preprocessing and
+postprocessing steps are documented inline with references to the
+equivalent Ultralytics code paths for comparison.
+
+This approach mirrors Hailo's official RPi5 reference implementation:
+  - Compiled C++ NMS (cv2.dnn.NMSBoxes vs. Hailo's Cython NMS)
+  - numpy matmul for proto × mask coefficients
+  - cv2.resize for bilinear mask upsampling
 
 Timing breakdown
 ----------------
@@ -18,7 +24,7 @@ The report separates image acquisition (decode) from the model pipeline:
   decode      — JPEG → numpy RGB buffer (cv2.imread + cvtColor)
   preprocess  — Letterbox resize, normalize [0,1], quantize to int8, HWC→CHW
   inference   — PCIe DMA host→device + NPU compute + PCIe DMA device→host
-  postprocess — Dequantize outputs, box decode, class-aware NMS, mask matmul
+  postprocess — Dequantize outputs, cv2.dnn.NMSBoxes, mask decode (cv2.resize)
 
 The "model-path" aggregate (pre + inf + post) represents what would run
 after image acquisition in a real camera/video pipeline.
@@ -38,9 +44,11 @@ Ultralytics' ONNX predictor does:
   4. Transpose BCN→BNC, xywh→xyxy, torchvision.ops.nms (compiled C++)
   5. Mask: coeffs @ protos → crop → bilinear upsample → threshold > 0
 
-This reference mirrors steps 1, 4, and 5 exactly. Steps 2-3 differ
-because the Ara240 NPU requires int8 quantized input and produces
-quantized output that must be dequantized before decoding.
+This reference replaces step 4-5 with:
+  4. cv2.dnn.NMSBoxes (OpenCV compiled C++ NMS, same algorithm)
+  5. numpy matmul + cv2.resize (same result, no torch dependency)
+Steps 2-3 differ because the Ara240 NPU requires int8 quantized input and
+produces quantized output that must be dequantized before decoding.
 
 Usage
 -----
@@ -291,8 +299,8 @@ def preprocess(rgb, input_h, input_w, qn, offset, signed):
 
 # ── Postprocessing helpers ────────────────────────────────────────────────────
 #
-# Box decode + NMS + mask decode are delegated to postprocess_numpy so
-# this module stays thin. See postprocess_numpy.py for the per-step
+# Box decode + NMS + mask decode are delegated to postprocess_opencv so
+# this module stays thin. See postprocess_opencv.py for the per-step
 # Ultralytics-equivalent commentary.
 
 def _dequantize(raw: np.ndarray, qn: float, offset: int) -> np.ndarray:
@@ -304,7 +312,7 @@ def _dequantize(raw: np.ndarray, qn: float, offset: int) -> np.ndarray:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Reference Ara240 YOLOv8-seg inference (dvapi + numpy/OpenCV)")
+        description="Reference Ara240 YOLOv8-seg inference (dvapi + numpy/opencv)")
     parser.add_argument("--model", required=True,
                         help="Path to .dvm model file")
     parser.add_argument("--images", required=True,
@@ -348,8 +356,7 @@ def main():
                              "(`ops.process_mask_native`): bilinear-upsample "
                              "the f32 logit plane to original resolution, "
                              "then threshold. Retina wins by ~0.6 pp mask "
-                             "mAP on coco128 (with this dvapi+numpy stack "
-                             "the speed difference is also small).")
+                             "mAP on coco128.")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                         help="Logging level (default INFO)")
@@ -401,7 +408,7 @@ def main():
 
         log.info("Model:   %s", args.model)
         log.info("Images:  %d from %s", len(image_paths), args.images)
-        log.info("Backend: reference (dvapi + numpy/OpenCV)")
+        log.info("Backend: reference (dvapi + numpy/opencv)")
         log.info("Output:  %s", args.output)
         log.info(
             "Input:   %d×%d×%d, qn=%.6f, offset=%d, signed=%s",
@@ -422,14 +429,32 @@ def main():
 
         if args.warmup > 0:
             log.info("Warmup: %d iterations...", args.warmup)
+            from .postprocess_opencv import (
+                decode_masks, decode_masks_retina,
+                postprocess_opencv, unletterbox_boxes, unletterbox_masks,
+            )
+            from .preprocess import LetterboxInfo
             for i in range(min(args.warmup, len(image_paths))):
                 bgr = cv2.imread(image_paths[i])
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                flat, *_ = preprocess(
+                flat, scale_w, pad_xw, pad_yw, orig_ww, orig_hw = preprocess(
                     rgb, meta.input_h, meta.input_w,
                     meta.input_qn, meta.input_offset, meta.input_signed)
                 input_tensor = DVTensor(flat, dv_model.input_param[0])
                 dv_model.infer_sync([input_tensor], output_tensors)
+                # Run full postprocess warmup (primes numpy/opencv caches)
+                warmup_float: dict[str, np.ndarray] = {}
+                for role, tm in meta.outputs.items():
+                    raw = output_tensors[tm.index].numpy_data.copy()
+                    if tm.dtype != np.int8:
+                        raw = raw.view(tm.dtype)
+                    raw = raw.reshape(tm.shape)
+                    warmup_float[role] = _dequantize(raw, tm.qn, tm.offset)
+                postprocess_opencv(
+                    warmup_float, meta.input_h, meta.input_w,
+                    args.score_threshold, args.iou_threshold,
+                    args.max_detections, with_masks=args.with_masks,
+                )
 
         # postprocess = nms_decode + mask_decode (per-detection upsample
         # + threshold). RLE encode is COCO-output formatting and lives
@@ -492,7 +517,7 @@ def main():
                 timings["npu_compute"].append(stats.npu_compute_ms)
                 timings["pci_output"].append(stats.output_transfer_time / 1000)
 
-            # 4. Postprocess: dequantize → decode → NMS → mask decode.
+            # 4. Postprocess: dequantize → cv2.dnn.NMSBoxes → mask decode.
             t0 = time.perf_counter()
 
             raw_by_role: dict[str, np.ndarray] = {}
@@ -503,9 +528,9 @@ def main():
                 raw = raw.reshape(tm.shape)
                 raw_by_role[role] = raw
 
-            from .postprocess_numpy import (
-                decode_masks, decode_masks_retina, postprocess_numpy,
-                unletterbox_boxes as _ulb, unletterbox_masks,
+            from .postprocess_opencv import (
+                decode_masks, decode_masks_retina,
+                postprocess_opencv, unletterbox_boxes, unletterbox_masks,
             )
             from .preprocess import LetterboxInfo
 
@@ -514,7 +539,7 @@ def main():
                 outputs_float[role] = _dequantize(
                     raw_by_role[role], tm.qn, tm.offset)
 
-            boxes_np, scores_np, classes_np, mask_logits = postprocess_numpy(
+            boxes_np, scores_np, classes_np, mask_logits = postprocess_opencv(
                 outputs_float, meta.input_h, meta.input_w,
                 args.score_threshold, args.iou_threshold,
                 args.max_detections, with_masks=args.with_masks,
@@ -524,7 +549,7 @@ def main():
             lb_info = LetterboxInfo(
                 scale=scale_f, pad_x=pad_x, pad_y=pad_y,
                 orig_w=orig_w, orig_h=orig_h)
-            boxes_orig = _ulb(boxes_np, lb_info)
+            boxes_orig = unletterbox_boxes(boxes_np, lb_info)
 
             # Mask decode (per-detection upsample + threshold) is part of
             # postprocess. Time it separately so the comparison with the
@@ -581,9 +606,9 @@ def main():
                       trimmed_stats(timings["pci_output"]), indent=1))
         print(fmt_row("postprocess (nms+mask)",
                       trimmed_stats(timings["postprocess"])))
-        print(fmt_row("nms_decode (numpy)",
+        print(fmt_row("nms_decode (cv2)",
                       trimmed_stats(timings["nms_decode"]), indent=1))
-        print(fmt_row("mask_decode (numpy)",
+        print(fmt_row("mask_decode (cv2)",
                       trimmed_stats(timings["mask_decode"]), indent=1))
         if any(t > 0 for t in timings["rle"]):
             print(fmt_row("output formatting (rle)",

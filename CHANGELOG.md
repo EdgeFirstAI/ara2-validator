@@ -33,7 +33,7 @@ This is the first publication-grade revision. The validator has been rewritten e
 - **`postprocess_hal.postprocess_hal()`, `_bridge_tensors()`, `_build_quant_list()`, `build_hal_metadata()`** — dead code from an earlier refactor.
 - **`--retina-masks` and `--mask-mode` flags** on `edgefirst.py` — collapsed into a single `--fast-masks` opt-out (retina by default).
 - **`--offset` flag** on `reference.py` — the dvapi.py + libaraclient stack is unstable past ~100 sequential inferences in a single process; chunking around it added complexity without solving the underlying issue. The script now documents the limitation in the `--max-images` help text and recommends the HAL path for full val5k runs.
-- **`reference.decode_outputs()`, `dequantize`, `xcycwh_to_xyxy`, `unletterbox_boxes`, `trimmed_stats`, `fmt_row`** — unused functions superseded by `postprocess_numpy` and `_stats`.
+- **`reference.decode_outputs()`, `dequantize`, `xcycwh_to_xyxy`, `unletterbox_boxes`, `trimmed_stats`, `fmt_row`** — unused functions superseded by `postprocess_opencv` and `_stats`.
 
 ### Performance
 
