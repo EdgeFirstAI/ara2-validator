@@ -8,7 +8,7 @@
 | **`reference`** | int8 NPU baseline using NXP dvapi.py | imx8mp-frdm, imx95-frdm |
 | **`edgefirst`** | int8 NPU + GPU letterbox + HAL Decoder | imx8mp-frdm, imx95-frdm |
 
-This validator augments the NXP-supplied dvapi reference with EdgeFirst HAL acceleration: GPU letterbox preprocessing rendered directly into the NPU input buffer, NMS and mask materialisation in compiled Rust, all sharing the dvproxy DMA-BUF surface for zero-copy data movement. It is an **offline benchmarking + validation tool**, not a production streaming application — each pipeline stage runs serially so per-stage cost is captured cleanly. For live camera/video inference with EdgeFirst, see the [ara2-rs examples](https://github.com/EdgeFirstAI/ara2-rs/tree/main/examples).
+This validator augments the NXP-supplied dvapi reference with EdgeFirst HAL acceleration: GPU letterbox preprocessing rendered directly into the NPU input buffer, detection decode and mask materialisation in compiled Rust, all sharing the dvproxy DMA-BUF surface for zero-copy data movement. It is an **offline benchmarking + validation tool**, not a production streaming application — each pipeline stage runs serially so per-stage cost is captured cleanly. For live camera/video inference with EdgeFirst, see the [ara2-rs examples](https://github.com/EdgeFirstAI/ara2-rs/tree/main/examples).
 
 ## Scope of this demonstration
 
@@ -36,14 +36,14 @@ The full COCO val2017 set. Drift columns are absolute **percentage points** (`mA
 All scripts run on-target so the per-stage timings are directly comparable. Two tables are shown: the first uses a **validation** score threshold of `0.001` (required for correct mAP computation — see note below); the second uses a **deployment** threshold of `0.5`, representative of real-time inference.
 
 > [!IMPORTANT]
-> **NMS and Mask timings are strongly threshold-dependent.** At the validation threshold of `0.001`, the model retains ~100–300 candidate detections per frame for NMS and ~5–15 surviving detections for mask materialisation. At a deployment threshold of `0.5`, only ~2–5 high-confidence detections survive, and both NMS and Mask drop accordingly. The validation table represents a worst-case timing bound; the deployment table represents real-world performance.
+> **Decode and Mask timings are strongly threshold-dependent.** At the validation threshold of `0.001`, the model retains ~100–300 candidate detections per frame for decode and ~5–15 surviving detections for mask materialisation. At a deployment threshold of `0.5`, only ~2–5 high-confidence detections survive, and both Decode and Mask drop accordingly. The validation table represents a worst-case timing bound; the deployment table represents real-world performance.
 
 > [!NOTE]
 > **Why `0.001`?** pycocotools computes mAP by integrating the precision-recall curve over 101 recall levels. This requires submitting *all* detections that might contribute to any recall level — including low-confidence true positives that only matter at high-recall operating points. A threshold of `0.5` truncates the P-R curve early, causing mAP to be underestimated (see the mAP columns below). The `0.001` threshold is the Ultralytics `val` default and is required for comparable, standards-compliant COCO evaluation.
 
 #### Validation threshold (`--score-threshold 0.001`)
 
-| Script | Mask | Box mAP | Mask mAP | Pre | Inf | NMS | Mask | End-to-end |
+| Script | Mask | Box mAP | Mask mAP | Pre | Inf | Decode | Mask | End-to-end |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
 | **imx8mp-frdm** | | | | | | | | |
 | `onnx_reference` (FP32, on-target CPU) | retina | **0.4533** | **0.3444** | 1.7 ms | 46.3 ms | — | 47.6 ms | 95.7 ms |
@@ -58,7 +58,7 @@ All scripts run on-target so the per-stage timings are directly comparable. Two 
 
 #### Deployment threshold (`--score-threshold 0.5`)
 
-| Script | Mask | Box mAP | Mask mAP | Pre | Inf | NMS | Mask | End-to-end |
+| Script | Mask | Box mAP | Mask mAP | Pre | Inf | Decode | Mask | End-to-end |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
 | **imx8mp-frdm** | | | | | | | | |
 | `edgefirst` (HAL) | retina | 0.2778 | 0.2434 | 6.1 ms | 13.4 ms | 2.2 ms | 3.5 ms | **25.2 ms** |
@@ -69,7 +69,7 @@ All scripts run on-target so the per-stage timings are directly comparable. Two 
 
 The `0.5` threshold reduces mAP by ~30% (0.40 → 0.28 Box, 0.32 → 0.24 Mask) because pycocotools can no longer integrate the full precision-recall curve — high-recall operating points are unreachable when low-confidence true positives are discarded before submission. This is an evaluation artefact, not a model quality difference: the model's actual detection capability is unchanged, only the evaluator's ability to measure it is truncated.
 
-`NMS` = HAL nms_decode (dequantisation, top-K filtering, box decode, NMS). `Mask` = mask materialisation (proto matmul, sigmoid, crop, resize). `End-to-end` = Pre + Inf + NMS + Mask. The `reference` and `onnx_reference` rows don't split NMS from Mask because Ultralytics performs both in a single fused `postprocess()` call. The dvapi+numpy reference is omitted from the imx95 block because the dvproxy / `libaraclient` stack on that board needs intermittent restarts.
+`Decode` = HAL `nms_decode` (dequantisation, top-K filtering, box decode, class-aware NMS, proto extraction). `Mask` = mask materialisation (proto matmul, sigmoid, crop, resize). `End-to-end` = Pre + Inf + Decode + Mask. The `reference` and `onnx_reference` rows don't split Decode from Mask because Ultralytics performs both in a single fused `postprocess()` call. The dvapi+numpy reference is omitted from the imx95 block because the dvproxy / `libaraclient` stack on that board needs intermittent restarts.
 
 #### NPU inference breakdown
 
@@ -83,13 +83,43 @@ The `Inf` column above is the wall-clock time `model.run()` takes — input-in, 
 
 The ~4.6 ms host-overhead delta between dvapi and edgefirst on imx8mp is the DMA-BUF benefit. The dvapi path moves the input tensor through a host buffer (numpy → libaraclient ctypes → dvproxy) and the output tensor back the same way; the edgefirst path uses `Tensor.from_fd` to wrap the dvproxy DMA-BUF directly, so the GPU letterbox writes the input DMA-BUF in place and HAL's Decoder reads the output DMA-BUF in place — the host never touches either buffer. The `HalPipeline` class is what wires this up; see its docstring for the construct-once / reuse-many invariants HAL Optimization Guide Rules 1, 4, and 5 require to keep the path zero-copy.
 
+#### Post-processing breakdown (Decode + Mask)
+
+The `Decode` and `Mask` columns in the timing tables represent the two phases of post-processing after NPU inference completes. Both operate entirely on the CPU (Cortex-A53 on imx8mp, Cortex-A55 on imx95) against the NPU output DMA-BUF.
+
+**Decode** (`nms_decode` in HAL) transforms the raw quantized NPU output grid into a filtered list of detections:
+
+| Sub-step | What it does | Cost driver |
+|----------|-------------|-------------|
+| Score dequantisation | Dequantize 8400×80 int8 score grid, find per-anchor class argmax | Fixed: 8400 anchors × 80 classes (NEON vectorised argmax) |
+| Score threshold filter | Reject anchors below confidence threshold | Fixed scan of 8400 scores |
+| Top-K pre-filter | Keep only the top 300 highest-scoring candidates (O(N) partial sort) | Threshold-dependent: at 0.001 typically 100–300 survive; at 0.5 only 2–5 |
+| Box dequantisation + decode | Dequantize int8 box coords for surviving candidates, apply stride grid, convert center→corner format | Linear in surviving candidates |
+| Class-aware NMS | Per-class IoU suppression (greedy, threshold 0.7) | Quadratic in per-class candidates (dominated by top-K cap) |
+| Proto extraction | Copy 819 KB prototype tensor from DMA-BUF (32 channels × 160×160) in native NCHW layout — no transpose | Fixed 0.4 ms memcpy (skipped entirely if 0 detections via lazy extraction) |
+
+Typical decode cost: **2.1–2.6 ms** depending on threshold and number of surviving candidates.
+
+**Mask Materialize** (`materialize_masks` in HAL) produces per-detection binary masks from the prototype tensor and per-detection mask coefficients:
+
+| Sub-step | What it does | Cost driver |
+|----------|-------------|-------------|
+| Proto matmul | For each detection: dot product of 32 mask coefficients × 32-channel prototype at each spatial position (160×160) | Linear in detections × 25,600 spatial positions |
+| Sigmoid activation | Apply σ(x) to the accumulated logits at each spatial position | Linear in detections × spatial resolution |
+| Crop to bbox | Zero out mask pixels outside the detection's bounding box | Negligible |
+| Resize to original | Bilinear upscale from 160×160 ROI to original image coordinates (**retina** mode) or skip (**fast** mode) | Dominates retina cost; proportional to output mask area |
+
+The matmul is the heaviest operation: for each detection, the NCHW kernel iterates over 32 channels, broadcasting each coefficient across the 160×160 spatial plane and accumulating. At the validation threshold (~5–15 detections survive NMS), this results in 5–15 × 32 × 25,600 = 4–15M multiply-accumulate operations. At the deployment threshold (~2–5 detections), cost drops proportionally.
+
+Typical mask cost: **retina 3.3–9.7 ms** (scales with detection count and output resolution), **fast 1.5–3.8 ms** (no final resize).
+
 ### What "end-to-end" measures
 
 `End-to-end` covers the per-frame work after image acquisition:
 
 1. **preprocess** — letterbox resize, normalise, quantise, lay out as the NPU's input tensor.
 2. **inference** — submit input, run NPU, retrieve output.
-3. **NMS decode** — dequantise the detection grid, apply top-K pre-filtering, decode box coordinates, run class-aware NMS.
+3. **decode** — dequantise the detection grid, apply top-K pre-filtering, decode box coordinates, run class-aware NMS, extract proto data.
 4. **mask materialisation** — per-detection proto coefficient × prototype matmul, sigmoid activation, crop to bbox, resize to original resolution.
 
 Stages excluded from end-to-end because they are validation-only or environment-specific:
@@ -119,11 +149,11 @@ The end-to-end numbers above come from a **serial** execution model: each stage 
 
 ![Serial pipeline timeline](assets/diagram_serial_execution.png)
 
-Drawn as a waterfall, the headroom becomes obvious: while any single stage runs, every other stage is idle. The GPU sits unused during NPU inference; the NPU sits unused during preprocess; the host sits unused during DMA transfers. With the NMS/Mask split visible, inference at 13 ms is the longest single stage; NMS (2.6 ms) and Mask (7.6 ms) are independent of the GPU and NPU and could overlap with the next frame's preprocess or inference in a pipelined deployment.
+Drawn as a waterfall, the headroom becomes obvious: while any single stage runs, every other stage is idle. The GPU sits unused during NPU inference; the NPU sits unused during preprocess; the host sits unused during DMA transfers. With the Decode/Mask split visible, inference at 13 ms is the longest single stage; Decode (2.6 ms) and Mask (7.6 ms) are independent of the GPU and NPU and could overlap with the next frame's preprocess or inference in a pipelined deployment.
 
 ![Pipeline waterfall](assets/diagram_pipeline.waterfall.png)
 
-A throughput-tuned deployment can overlap stages across consecutive frames — start preprocessing frame *N+1* the moment frame *N*'s preprocess finishes, regardless of whether frame *N*'s NPU inference is still running. With four pipeline stages (Pre 6 ms | Inf 13 ms | NMS 2.6 ms | Mask 9.7 ms), once the pipeline is filled the throughput *period* collapses to the **slowest single stage** (13.5 ms, inference → 74 FPS). NMS and Mask together (12.3 ms) fit inside the inference window, so they are fully hidden in the concurrent case.
+A throughput-tuned deployment can overlap stages across consecutive frames — start preprocessing frame *N+1* the moment frame *N*'s preprocess finishes, regardless of whether frame *N*'s NPU inference is still running. With four pipeline stages (Pre 6 ms | Inf 13 ms | Decode 2.6 ms | Mask 9.7 ms), once the pipeline is filled the throughput *period* collapses to the **slowest single stage** (13.5 ms, inference → 74 FPS). Decode and Mask together (12.3 ms) fit inside the inference window, so they are fully hidden in the concurrent case.
 
 ![Concurrent pipeline](assets/diagram_pipeline_overlap.png)
 
@@ -133,7 +163,7 @@ Per-frame **latency** is unchanged. Any one frame still has to walk through ever
 
 Execution scheduling aside, the validator's data path is the same path a live camera pipeline uses on this hardware. Frames are loaded from disk rather than from a sensor, but they are loaded straight into **DMA-BUF-backed EdgeFirst tensors** — the same tensor type `edgefirst-ara2` produces from a V4L2 capture. From the GPU letterbox onward, the validator and a live pipeline see identical surfaces: the GPU writes the NPU input DMA-BUF in place, the NPU produces an output DMA-BUF, HAL's Decoder reads it without staging, and HAL's mask materialisation runs against the same proto tensor. Swapping the disk loader for a camera capture is the only change needed to repurpose `HalPipeline` as the inner loop of a live application — and that is exactly the shape of [`ara2-rs/examples/yolov8_live.py`](https://github.com/EdgeFirstAI/ara2-rs/blob/main/examples/yolov8_live.py).
 
-One caveat is worth calling out: **both NMS and Mask stages are threshold-dependent.** The validation table (threshold `0.001`) retains many more candidate detections through NMS and materialises more masks than a deployment would. Compare the two tables above: at `0.5`, NMS drops from 2.6 ms to 2.2 ms (fewer candidates to sort) and Mask drops from 9.7 ms to 3.5 ms (fewer surviving detections to materialise). For the fused `draw_masks` deployment path, see [Fused draw_masks timing](#fused-draw_masks-timing).
+One caveat is worth calling out: **both Decode and Mask stages are threshold-dependent.** The validation table (threshold `0.001`) retains many more candidate detections through NMS and materialises more masks than a deployment would. Compare the two tables above: at `0.5`, Decode drops from 2.6 ms to 2.2 ms (fewer candidates to sort) and Mask drops from 9.7 ms to 3.5 ms (fewer surviving detections to materialise). For the fused `draw_masks` deployment path, see [Fused draw_masks timing](#fused-draw_masks-timing).
 
 ## Installation
 
@@ -149,7 +179,7 @@ pip install --upgrade pip
 pip install 'ara2-validator[hal] @ git+https://github.com/EdgeFirstAI/ara2-validator.git'
 ```
 
-The `[hal]` extra pulls [`edgefirst-hal>=0.18.2`](https://github.com/EdgeFirstAI/hal) and `edgefirst-ara2`. The `>=0.18.2` floor is required: 0.17.x ships a scalar `materialize_masks` (~569 ms / image at N=119 detections), 0.18.0 regressed rayon parallelism (PR #51), 0.18.1 restored it (~33 ms / image), and 0.18.2 adds NMS decode, NCHW proto layout elimination, and mask materialisation optimizations (NMS 2.6 ms + Mask 9.7 ms on imx8mp-frdm retina at validation threshold).
+The `[hal]` extra pulls [`edgefirst-hal>=0.18.2`](https://github.com/EdgeFirstAI/hal) and `edgefirst-ara2`. The `>=0.18.2` floor is required: 0.17.x ships a scalar `materialize_masks` (~569 ms / image at N=119 detections), 0.18.0 regressed rayon parallelism (PR #51), 0.18.1 restored it (~33 ms / image), and 0.18.2 adds detection decode, NCHW proto layout elimination, and mask materialisation optimizations (Decode 2.6 ms + Mask 9.7 ms on imx8mp-frdm retina at validation threshold).
 
 ### Host (FP32 ONNX baseline)
 
@@ -307,15 +337,15 @@ preprocess (GPU)                    4.11     3.34     4.79
 inference (wall)                   11.25    11.03    11.52
   dma input (host→device)             1.96     1.95     2.03
   dma output (device→host)            2.96     2.94     3.01
-postprocess (nms+mask)             10.12     3.66    24.60
-  nms_decode (HAL)                    2.56     2.19     2.98
-  materialize_hal                     7.55     1.33    21.97
+postprocess (decode+mask)          10.12     3.66    24.60
+  decode (HAL)                        2.56     2.19     2.98
+  mask materialize                    7.55     1.33    21.97
   Model-path (pre+inf+post, excl. output): 25.47 ms (39.3 FPS)
 ```
 
 Key metrics to compare:
-- **nms_decode** — NMS + dequantisation in compiled Rust
-- **materialize_hal** — mask materialisation (retina ~7–10 ms, fast ~2–3 ms)
+- **decode** — detection decode (dequantisation + NMS + proto extraction) in compiled Rust
+- **mask materialize** — mask materialisation (retina ~7–10 ms, fast ~2–3 ms)
 - **Model-path** — end-to-end excluding output formatting (the number reported in the timing table above)
 
 Accuracy is reported below the timing table as Box mAP@0.50:0.95 and Mask mAP@0.50:0.95.
@@ -355,7 +385,7 @@ flowchart TD
     subgraph hal_path[EdgeFirst HAL — on-target]
         E1[HAL GPU letterbox<br/>writes NPU input DMA-BUF]:::gpu
         E2[edgefirst-ara2 → libaraclient<br/>via /var/run/ara2.sock]:::npu
-        E3[HAL Decoder NMS + dequant<br/>HAL materialize_masks]:::gpu
+        E3[HAL Decoder + dequant<br/>HAL materialize_masks]:::gpu
     end
 
     H1 --> H2 --> H3 --> COCO[COCO JSON<br/>bbox + segm]:::host
@@ -366,7 +396,7 @@ flowchart TD
 The `edgefirst` path differs from the `reference` path in three places:
 
 - **Preprocess** runs on the GPU and writes its result directly into the DMA-BUF surface that dvproxy will hand to the NPU as its input tensor — no host-side copy between letterbox output and NPU input.
-- **NMS + dequantisation** runs in compiled Rust against the dvproxy output DMA-BUF surface, so the HAL Decoder reads the NPU output without staging through host memory.
+- **Decode (dequantisation + NMS)** runs in compiled Rust against the dvproxy output DMA-BUF surface, so the HAL Decoder reads the NPU output without staging through host memory.
 - **Mask materialisation** runs in HAL's batched-GEMM kernel (rayon-parallel) instead of a per-detection numpy `cv2.resize`.
 
 ### Capability matrix
@@ -376,7 +406,7 @@ The `edgefirst` path differs from the `reference` path in three places:
 | Device | PC / any CPU, or on-target | imx8mp-frdm, imx95-frdm | imx8mp-frdm, imx95-frdm |
 | Runtime | ONNX Runtime | dvapi → libaraclient | edgefirst-ara2 → libaraclient |
 | Preprocess | cv2 (CPU) | cv2 + int8 quant (CPU) | HAL GPU (DMA-BUF) |
-| NMS | numpy (CPU) | numpy + dequant (CPU) | HAL Decoder (Rust) |
+| Decode | numpy (CPU) | numpy + dequant (CPU) | HAL Decoder (Rust) |
 | Mask decode | numpy retina or process_mask | numpy retina or process_mask | HAL `materialize_masks` (Scaled or Proto) |
 | Box eval | ✅ bbox | ✅ bbox | ✅ bbox |
 | Mask eval | ✅ segm | ✅ segm | ✅ segm |
@@ -510,7 +540,7 @@ int8 quantisation produces protos that are near-identical but not bit-identical 
 
 ### `edgefirst`
 
-- `edgefirst-hal>=0.18.2` — GPU-accelerated preprocessing and postprocessing (the floor is required: 0.17.x ships a scalar `materialize_masks` ~75× slower; 0.18.0 dropped the rayon parallelism the kernel needs; 0.18.1 restored it; 0.18.2 adds NMS decode and mask materialisation optimizations)
+- `edgefirst-hal>=0.18.2` — GPU-accelerated preprocessing and postprocessing (the floor is required: 0.17.x ships a scalar `materialize_masks` ~75× slower; 0.18.0 dropped the rayon parallelism the kernel needs; 0.18.1 restored it; 0.18.2 adds detection decode and mask materialisation optimizations)
 - `edgefirst-ara2` — Rust/pyo3 wrapper around libaraclient with DMA-BUF tensor mapping
 - Same `dvproxy` + `libaraclient.so` requirements as `reference`
 

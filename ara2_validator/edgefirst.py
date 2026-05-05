@@ -14,7 +14,7 @@ Pipeline overview
     JPEG  ─┬─►  HAL GPU letterbox  ──►  NPU input DMA-BUF
            │   (DMA-to-DMA, zero-copy)
            │
-    NPU output DMA-BUF  ──►  HAL Decoder NMS  ──►  HAL materialize_masks
+    NPU output DMA-BUF  ──►  HAL Decoder  ──►  HAL materialize_masks
                             (compiled Rust)         (rayon-parallel)
 
 The HAL setup is encapsulated in :class:`HalPipeline` (see
@@ -33,12 +33,13 @@ The script reports per-stage means after a 1 % trim:
 * ``preprocess``     — GPU letterbox-resize (DMA-to-DMA).
 * ``inference``      — NPU compute including PCIe DMA transfers
   (sub-timings shown below this row).
-* ``postprocess``    — ``nms_decode`` (HAL Decoder) +
-  ``materialize_hal`` (HAL ``materialize_masks`` call). This is the
-  HAL-side mask work; ``paste`` and ``rle`` are reported separately
-  under "output formatting" because they are COCO-output formatting
-  (binary canvas paste + ``pycocotools.mask.encode``), not part of
-  the inference pipeline.
+* ``postprocess``    — ``decode`` (HAL Decoder: dequantise, top-K,
+  box decode, NMS, proto extraction) + ``mask materialize`` (HAL
+  ``materialize_masks`` call). This is the HAL-side post-processing;
+  ``paste`` and ``rle`` are reported separately under "output
+  formatting" because they are COCO-output formatting (binary canvas
+  paste + ``pycocotools.mask.encode``), not part of the inference
+  pipeline.
 * ``model-path``     — ``preprocess + inference + postprocess``,
   excluding output formatting. This is what would run after image
   acquisition in a real camera/video pipeline.
@@ -297,9 +298,9 @@ def main() -> int:
     print(fmt_row("dma input (host→device)", trimmed_stats(timings["dma_input"]), indent=1))
     print(fmt_row("npu compute", trimmed_stats(timings["npu_compute"]), indent=1))
     print(fmt_row("dma output (device→host)", trimmed_stats(timings["dma_output"]), indent=1))
-    print(fmt_row("postprocess (nms+mask)", trimmed_stats(timings["postprocess"])))
-    print(fmt_row("nms_decode (HAL)", trimmed_stats(timings["nms_decode"]), indent=1))
-    print(fmt_row("materialize_hal", trimmed_stats(timings["materialize_hal"]), indent=1))
+    print(fmt_row("postprocess (decode+mask)", trimmed_stats(timings["postprocess"])))
+    print(fmt_row("decode (HAL)", trimmed_stats(timings["nms_decode"]), indent=1))
+    print(fmt_row("mask materialize", trimmed_stats(timings["materialize_hal"]), indent=1))
     if any(t > 0 for t in timings["paste"]):
         # Output formatting — NOT part of postprocess / model-path.
         # Reported separately so the inference cost is comparable
