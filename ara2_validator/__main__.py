@@ -58,13 +58,16 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Output COCO results JSON path")
     parser.add_argument("--labels", default=None,
                         help="Path to labels.txt (fallback if not in DVM)")
-    parser.add_argument("--backend", choices=["numpy", "hal", "hailo"],
+    parser.add_argument("--backend",
+                        choices=["numpy", "hal", "hailo", "hal-hailo"],
                         default="hal",
                         help="Preprocessing + postprocessing backend "
                              "(default: hal). 'hailo' expects --model to "
                              "point at a .hef file and uses the vendored "
-                             "TAPPAS reference postprocess for head-to-head "
-                             "comparison against HAL.")
+                             "TAPPAS reference postprocess. 'hal-hailo' "
+                             "expects a .hef and uses HAL preprocess + HAL "
+                             "decode (the apples-to-apples comparison "
+                             "against TAPPAS on identical Hailo NPU).")
     parser.add_argument("--score-threshold", type=float, default=0.001,
                         help="NMS score threshold (default 0.001 — "
                              "Ultralytics val convention)")
@@ -463,6 +466,175 @@ def _print_summary_hal(timings: dict[str, list[float]]) -> None:
     _print_total(timings, hdr_len=len(hdr))
 
 
+def _run_hal_hailo(args, image_paths: list[str]) -> list[dict]:
+    """HAL+Hailo backend: HAL preprocess + Hailo NPU + HAL decode.
+
+    Drives a Hailo HEF directly (like ``--backend hailo``) but runs all
+    preprocessing and decoding through EdgeFirst HAL — the apples-to-apples
+    comparison point for TAPPAS-on-Hailo. See
+    :class:`ara2_validator.hal_hailo_pipeline.HalHailoPipeline`.
+    """
+    from .hal_hailo_pipeline import HalHailoPipeline
+    from .hal_pipeline import unletterbox_box_array
+    from .postprocess_hal import MaskMode, materialize_masks_for_coco_rle
+
+    log.info("HEF:     %s", args.model)
+    log.info("HAL:     edgefirst_hal %s", _hal_version())
+    log.info(
+        "Mask:    %s",
+        "fast (Proto+cv2)" if args.fast_masks else "retina (Scaled)",
+    )
+
+    pipeline = HalHailoPipeline(
+        args.model,
+        score_threshold=args.score_threshold,
+        iou_threshold=args.iou_threshold,
+        max_detections=args.max_detections,
+    )
+    log.info(
+        "Model input: %d×%d×%d",
+        pipeline.input_h, pipeline.input_w, pipeline.input_channels,
+    )
+    log.info(
+        "Outputs: %s",
+        ", ".join(
+            f"{name} → {pipeline._schema_name_for[name]}"
+            for name in pipeline.output_names
+        ),
+    )
+
+    mode = MaskMode.FAST if args.fast_masks else MaskMode.RETINA
+
+    if args.warmup > 0:
+        log.info("Warmup: %d iterations...", args.warmup)
+        pipeline.warmup(image_paths, n=args.warmup)
+
+    timings: dict[str, list[float]] = {
+        "decode": [], "preprocess": [], "inference": [],
+        "nms_decode": [], "materialize_hal": [],
+        "paste": [], "rle": [],
+        "postprocess": [], "total": [],
+    }
+    all_results: list[dict] = []
+    mask_failures = 0
+
+    for idx, img_path in enumerate(image_paths):
+        t_total = time.perf_counter()
+
+        result = pipeline.infer_one(img_path)
+
+        mask_result = None
+        if (not args.no_masks
+                and result.proto_data is not None
+                and len(result.scores) > 0):
+            try:
+                mask_result = materialize_masks_for_coco_rle(
+                    pipeline.processor,
+                    result.boxes, result.scores, result.classes,
+                    result.proto_data, result.lb_info,
+                    pipeline.input_w, pipeline.input_h,
+                    mode=mode,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "[hal-hailo] materialize_masks failed on %s: %s: %s",
+                    Path(img_path).name, type(e).__name__, e,
+                )
+                mask_failures += 1
+
+        for k, v in result.timings.items():
+            timings[k].append(v)
+        if mask_result is not None:
+            timings["materialize_hal"].append(
+                mask_result.timings.materialize_hal_ms,
+            )
+            timings["paste"].append(mask_result.timings.paste_ms)
+            timings["rle"].append(mask_result.timings.rle_ms)
+        else:
+            timings["materialize_hal"].append(0.0)
+            timings["paste"].append(0.0)
+            timings["rle"].append(0.0)
+        timings["postprocess"].append(
+            timings["nms_decode"][-1] + timings["materialize_hal"][-1],
+        )
+
+        # HAL Decoder returns boxes normalized [0, 1] in letterbox space.
+        boxes_orig = unletterbox_box_array(
+            result.boxes, result.lb_info,
+            pipeline.input_w, pipeline.input_h,
+            normalized=True,
+        )
+        scores_np = np.asarray(result.scores, dtype=np.float32)
+        classes_np = np.asarray(result.classes, dtype=np.uint64)
+        rles = mask_result.rles if mask_result is not None else None
+        all_results.extend(
+            build_coco_results(
+                img_path, boxes_orig, scores_np, classes_np, rles,
+            )
+        )
+
+        timings["total"].append((time.perf_counter() - t_total) * 1e3)
+
+        if (idx + 1) % 10 == 0 or idx == 0 or idx == len(image_paths) - 1:
+            avg = float(np.mean(timings["total"][-10:]))
+            log.info(
+                "  [%4d/%d] %20s  %3d dets  %6.1f ms/img",
+                idx + 1, len(image_paths), Path(img_path).name,
+                len(result.scores), avg,
+            )
+
+    if mask_failures:
+        log.warning(
+            "[hal-hailo] %d/%d frames had mask materialisation failures",
+            mask_failures, len(image_paths),
+        )
+    _print_summary_hal_hailo(timings)
+
+    # HailoRT + HAL teardown races on Linux — cleanest workaround is to
+    # save the COCO JSON before pipeline goes out of scope. Bypass the
+    # main() save path by returning an empty list; main() detects it
+    # via args.output already existing.
+    log.info("Total detections: %d", len(all_results))
+    save_coco_results(all_results, args.output)
+    log.info("Saved to: %s", args.output)
+    pipeline.close()
+    return []
+
+
+def _print_summary_hal_hailo(timings: dict[str, list[float]]) -> None:
+    """HAL+Hailo backend timing summary.
+
+    Mirrors :func:`_print_summary_hal` but with no DMA breakdown — the
+    Hailo NPU's PCIe transfers aren't surfaced through HailoRT's Python
+    bindings the way Ara240 firmware reports them. Full-frame wall-clock
+    is what we want anyway for the comparison against TAPPAS.
+    """
+    print()
+    hdr = summary_header()
+    print(hdr)
+    print("─" * len(hdr))
+    print(fmt_row("image decode", trimmed_stats(timings["decode"])))
+    print(fmt_row("preprocess (HAL GPU)",
+                  trimmed_stats(timings["preprocess"])))
+    print(fmt_row("inference (wall)",
+                  trimmed_stats(timings["inference"])))
+    print(fmt_row("postprocess (HAL)",
+                  trimmed_stats(timings["postprocess"])))
+    print(fmt_row("nms_decode (HAL)",
+                  trimmed_stats(timings["nms_decode"]), indent=1))
+    print(fmt_row("materialize_hal",
+                  trimmed_stats(timings["materialize_hal"]), indent=1))
+    if any(t > 0 for t in timings["paste"]):
+        of_total = [
+            timings["paste"][i] + timings["rle"][i]
+            for i in range(len(timings["paste"]))
+        ]
+        print(fmt_row("output formatting", trimmed_stats(of_total)))
+        print(fmt_row("paste", trimmed_stats(timings["paste"]), indent=1))
+        print(fmt_row("rle encode", trimmed_stats(timings["rle"]), indent=1))
+    _print_total(timings, hdr_len=len(hdr))
+
+
 def _print_summary_hailo(timings: dict[str, list[float]]) -> None:
     """Hailo backend timing summary.
 
@@ -549,6 +721,10 @@ def main() -> int:
         # no Ara240-specific tensor spec. The pipeline introspects the
         # HEF for input dims and output names itself.
         all_results = _run_hailo(args, image_paths)
+    elif args.backend == "hal-hailo":
+        # Same .hef-only pattern as 'hailo', but routes preprocess +
+        # decode + masks through HAL for the apples-to-apples comparison.
+        all_results = _run_hal_hailo(args, image_paths)
     else:
         from .model import load_model
         model, spec = load_model(
@@ -571,9 +747,13 @@ def main() -> int:
         else:
             all_results = _run_numpy(args, image_paths, spec, model)
 
-    log.info("Total detections: %d", len(all_results))
-    save_coco_results(all_results, args.output)
-    log.info("Saved to: %s", args.output)
+    if args.backend != "hal-hailo":
+        # hal-hailo backend already saved inside _run_hal_hailo to avoid
+        # a known HailoRT+HAL teardown race when pipeline destruction
+        # outlives the save. Other backends save here as before.
+        log.info("Total detections: %d", len(all_results))
+        save_coco_results(all_results, args.output)
+        log.info("Saved to: %s", args.output)
     return 0
 
 
