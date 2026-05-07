@@ -75,8 +75,8 @@ Full COCO val2017. End-to-end = preprocess + inference + decode + mask materiali
 | imx95-frdm | `reference` dvapi+opencv | reference | fast | 0.3941 | — | 0.3221 | — | 17 ms | 16 ms | 31 ms | 193 ms | 257 ms |
 | imx95-frdm | `edgefirst` HAL | EdgeFirst | retina | 0.3966 | — | 0.3231 | — | 4.1 ms | 11.3 ms | 2.6 ms | 7.6 ms | **25.5 ms** |
 | imx95-frdm | `edgefirst` HAL | EdgeFirst | fast | 0.3966 | — | 0.3103 | — | 4.1 ms | 11.3 ms | 2.5 ms | 2.9 ms | **20.8 ms** |
-| RPi5 + Hailo-8L | `hailo` TAPPAS reference | reference | fused | 0.2764 | 0.4202 | 0.2026 | 0.3587 | 0.86 ms | 15.74 ms | — fused 1034.32 ms — | | **1050.94 ms** |
-| RPi5 + Hailo-8L | `hal-hailo` HAL | EdgeFirst | retina | **0.3965** | **0.5442** | **0.3187** | **0.4934** | 2.24 ms | 16.46 ms | 9.05 ms | 1.72 ms | **29.48 ms** |
+| RPi5 + Hailo-8L | `hailo` TAPPAS reference | reference | fused | 0.2764 | 0.4202 | 0.2026 | 0.3587 | 0.88 ms | 15.78 ms | — fused 1039.36 ms — | | **1056.04 ms** |
+| RPi5 + Hailo-8L | `hal-hailo` HAL | EdgeFirst | retina | **0.3965** | **0.5442** | **0.3187** | **0.4934** | 2.25 ms | 16.42 ms | 9.03 ms | 1.70 ms | **29.41 ms** |
 
 > [!IMPORTANT]
 > Every row above is a **synchronous, single-frame-in-flight** measurement — no double-buffering, no async dispatch, no concurrent stages. See [Why per-stage, why serial](#why-per-stage-why-serial).
@@ -91,8 +91,8 @@ Same dataset, score threshold 0.5 — representative of real-time inference wher
 | imx8mp-frdm | `edgefirst` HAL | EdgeFirst | fast | 0.2778 | — | 0.2364 | — | 6.2 ms | 13.4 ms | 2.3 ms | 1.8 ms | **23.6 ms** |
 | imx95-frdm | `edgefirst` HAL | EdgeFirst | retina | 0.2793 | — | 0.2475 | — | 3.9 ms | 11.3 ms | 2.1 ms | 3.3 ms | **20.5 ms** |
 | imx95-frdm | `edgefirst` HAL | EdgeFirst | fast | 0.2793 | — | 0.2395 | — | 3.9 ms | 11.3 ms | 2.2 ms | 1.5 ms | **18.9 ms** |
-| RPi5 + Hailo-8L | `hailo` TAPPAS reference | reference | fused | **0.2855** | **0.3461** | 0.1784 | 0.3130 | 0.94 ms | 15.73 ms | — fused 48.77 ms — | | **65.46 ms** |
-| RPi5 + Hailo-8L | `hal-hailo` HAL | EdgeFirst | retina | 0.2474 | 0.3076 | **0.2160** | **0.2997** | 2.23 ms | 16.42 ms | 8.82 ms | 0.62 ms | **28.10 ms** |
+| RPi5 + Hailo-8L | `hailo` TAPPAS reference | reference | fused | **0.2855** | **0.3461** | 0.1784 | 0.3130 | 0.92 ms | 15.68 ms | — fused 48.80 ms — | | **65.41 ms** |
+| RPi5 + Hailo-8L | `hal-hailo` HAL | EdgeFirst | retina | 0.2474 | 0.3076 | **0.2160** | **0.2997** | 2.22 ms | 16.42 ms | 8.93 ms | 0.62 ms | **28.21 ms** |
 
 > [!NOTE]
 > At the deployment threshold, TAPPAS Box mAP (0.286) exceeds HAL (0.247). This is not an accuracy regression — at the validation threshold (the correct measurement) HAL wins by +12 pp. At 0.5, HAL's per-scale Decoder filters more aggressively at the score check, dropping medium-confidence detections; with the truncated P-R curve, retaining those detections looks like accuracy. The full-curve numbers at 0.001 are the unambiguous ranking.
@@ -165,7 +165,7 @@ Measured mask timings (imx95-frdm, scaled mode):
 
 ### Hailo TAPPAS postprocess scaling
 
-At `0.001`, TAPPAS postprocess takes 1034 ms / frame (1.0 FPS) because its NMS is naive O(N²) over ~76 candidates per cell passing the 0.001 score gate. HAL's per-scale Decoder uses indexed top-K + class-aware NMS in compiled Rust and stays at ~9 ms regardless of threshold. At `0.5` the same TAPPAS postprocess drops to 49 ms / frame (15.3 FPS) — still 1.7× slower than HAL's 28 ms. Same NPU output, same model, same detected boxes — fundamentally different NMS scaling.
+At `0.001`, TAPPAS postprocess takes ~1040 ms / frame (~1.0 FPS) because its NMS is naive O(N²) over ~76 candidates per cell passing the 0.001 score gate. HAL's per-scale Decoder uses indexed top-K + class-aware NMS in compiled Rust and stays at ~9 ms regardless of threshold. At `0.5` the same TAPPAS postprocess drops to ~49 ms / frame (15.3 FPS) — still 1.7× slower than HAL's ~28 ms. Same NPU output, same model, same detected boxes — fundamentally different NMS scaling.
 
 ## Why per-stage, why serial
 
@@ -593,12 +593,12 @@ Each run prints a timing table followed by COCO mAP:
 
 ```
 Stage                               Mean      Min      Max  ms
-preprocess (GPU)                    2.24     1.98     2.61
-inference (wall)                   16.46    15.87    17.21
-postprocess (decode+mask)          10.77     8.12    15.43
-  nms_decode (HAL)                   9.05     7.44    12.08
-  mask materialize                   1.72     0.64     3.35
-  Model-path (pre+inf+post, excl. output): 29.48 ms (33.9 FPS)
+preprocess (GPU)                    2.25     2.03     2.73
+inference (wall)                   16.42    16.36    16.49
+postprocess (decode+mask)          10.74     9.06    14.39
+  nms_decode (HAL)                   9.03     8.76    10.07
+  mask materialize                   1.70     0.10     5.33
+  Model-path (pre+inf+post, excl. output): 29.41 ms (34.0 FPS)
 ```
 
 - **nms_decode** — per-scale DFL decode, dequant, top-K, class-aware NMS, proto extraction (Rust)
