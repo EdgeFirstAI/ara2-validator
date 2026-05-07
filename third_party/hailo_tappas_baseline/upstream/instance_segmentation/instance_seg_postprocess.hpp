@@ -111,7 +111,17 @@ void draw_masks_and_boxes(cv::Mat &frame,
                                    float thresh = 0.5f);
 
 __BEGIN_DECLS
+// 3-arg overload preserved for the GStreamer `hailofilter` element which
+// dlopens this exact symbol. Internally forwards to the 5-arg form below
+// with the upstream defaults.
 std::vector<cv::Mat> filter(HailoROIPtr roi, int org_width, int org_height);
 __END_DECLS
+
+// 5-arg overload added for embedded benchmarking that needs runtime control
+// over the score/IoU thresholds (e.g. Ultralytics val convention of 0.001
+// for proper P-R curve integration). Declared with C++ linkage (outside the
+// __BEGIN_DECLS block) so the two overloads coexist.
+std::vector<cv::Mat> filter(HailoROIPtr roi, int org_width, int org_height,
+                            float score_threshold, float iou_threshold);
 
 #endif

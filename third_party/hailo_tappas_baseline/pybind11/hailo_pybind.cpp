@@ -209,7 +209,9 @@ public:
         cfg_ = std::make_unique<ConfiguredInferModel>(std::move(cfg.value()));
     }
 
-    py::dict infer(py::array_t<uint8_t, py::array::c_style | py::array::forcecast> image_bgr)
+    py::dict infer(py::array_t<uint8_t, py::array::c_style | py::array::forcecast> image_bgr,
+                   float score_threshold = 0.6f,
+                   float iou_threshold = 0.7f)
     {
         auto buf = image_bgr.request();
         if (buf.ndim != 3 || buf.shape[2] != 3)
@@ -304,7 +306,8 @@ public:
             auto roi = build_roi_from_outputs(outputs);
             // Pass model dims (NOT org dims) so TAPPAS produces masks in
             // letterbox space; we unmap to org coords below.
-            masks_model_space = filter(roi, model_h_, model_w_);
+            masks_model_space = filter(roi, model_h_, model_w_,
+                                       score_threshold, iou_threshold);
             dets = get_detections_from_roi(roi);
             post_ms = ms_since(t_post);
         }
@@ -403,10 +406,16 @@ PYBIND11_MODULE(hailo_tappas_baseline, m) {
     py::class_<HailoTappasBackend>(m, "HailoTappasBackend")
         .def(py::init<const std::string &>(), py::arg("hef_path"),
              "Open HEF and configure HailoRT InferModel for single-frame sync inference.")
-        .def("infer", &HailoTappasBackend::infer, py::arg("image_bgr"),
+        .def("infer", &HailoTappasBackend::infer,
+             py::arg("image_bgr"),
+             py::arg("score_threshold") = 0.6f,
+             py::arg("iou_threshold") = 0.7f,
              "Run the full per-frame pipeline (OpenCV letterbox + HailoRT + TAPPAS decode).\n\n"
              "Args:\n"
-             "    image_bgr: uint8 BGR ndarray shaped (H, W, 3), as returned by cv2.imread.\n\n"
+             "    image_bgr: uint8 BGR ndarray shaped (H, W, 3), as returned by cv2.imread.\n"
+             "    score_threshold: confidence threshold applied during box decode (default 0.6,\n"
+             "        the upstream TAPPAS sample default; use 0.001 for Ultralytics-style val).\n"
+             "    iou_threshold: NMS IoU threshold (default 0.7).\n\n"
              "Returns dict with keys:\n"
              "    boxes (N, 4) float32 xyxy normalized [0, 1] in original-image coords\n"
              "    scores (N,) float32\n"

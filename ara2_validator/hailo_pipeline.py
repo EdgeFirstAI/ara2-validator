@@ -121,27 +121,22 @@ class HailoTappasPipeline:
         Path to a compiled HEF (Hailo's reference or one produced by
         hailo-converter v0.3.0+).
     score_threshold, iou_threshold : float
-        **Currently informational only** — both are baked into the
-        vendored postprocess source at compile time
-        (``SCORE_THRESHOLD = 0.6f``, ``IOU_THRESHOLD = 0.7f`` in
-        ``instance_seg_postprocess.cpp``). Passing different values
-        here logs a warning so we don't silently mislead the user;
-        making these runtime-tunable is a follow-up tracked in
-        ``third_party/hailo_tappas_baseline/pybind11/README.md``.
+        Forwarded to the patched upstream ``filter()`` overload on
+        every frame. Defaults match the upstream sample
+        (``0.6`` / ``0.7``); use ``0.001`` for Ultralytics-style val
+        which is what pycocotools needs to integrate the full
+        precision-recall curve.
     max_detections : int
         Currently unused — the upstream postprocess does not cap
         detection count beyond NMS itself.
     """
 
-    DEFAULT_SCORE_THRESHOLD = 0.6
-    DEFAULT_IOU_THRESHOLD = 0.7
-
     def __init__(
         self,
         hef_path: str,
         *,
-        score_threshold: float = DEFAULT_SCORE_THRESHOLD,
-        iou_threshold: float = DEFAULT_IOU_THRESHOLD,
+        score_threshold: float = 0.6,
+        iou_threshold: float = 0.7,
         max_detections: int = 300,
     ):
         if _shim is None:
@@ -155,22 +150,11 @@ class HailoTappasPipeline:
             )
 
         self.backend = _shim.HailoTappasBackend(hef_path)
-        self.score_threshold = score_threshold
-        self.iou_threshold = iou_threshold
+        self.score_threshold = float(score_threshold)
+        self.iou_threshold = float(iou_threshold)
         self.max_detections = max_detections
         self.input_w = int(self.backend.model_width)
         self.input_h = int(self.backend.model_height)
-
-        if (score_threshold != self.DEFAULT_SCORE_THRESHOLD
-                or iou_threshold != self.DEFAULT_IOU_THRESHOLD):
-            log.warning(
-                "Hailo TAPPAS thresholds are baked at the C++ level "
-                "(SCORE=%.3f, IOU=%.3f). Requested score=%.3f / iou=%.3f "
-                "are ignored until upstream is patched to read them at "
-                "runtime.",
-                self.DEFAULT_SCORE_THRESHOLD, self.DEFAULT_IOU_THRESHOLD,
-                score_threshold, iou_threshold,
-            )
 
     def warmup(self, image_paths, n: int = 3) -> None:
         """Run ``n`` warmup iterations to settle thread pools and caches."""
@@ -178,7 +162,7 @@ class HailoTappasPipeline:
             bgr = cv2.imread(str(image_path))
             if bgr is None:
                 continue
-            self.backend.infer(bgr)
+            self.backend.infer(bgr, self.score_threshold, self.iou_threshold)
 
     def infer_one(self, image_path) -> HailoInferenceResult:
         """Run the full Hailo TAPPAS pipeline on one image.
@@ -212,7 +196,9 @@ class HailoTappasPipeline:
         # excludes the GIL acquire/release boundary cost, which a
         # naive Python ``time.perf_counter`` around ``backend.infer()``
         # would lump into ``inference_ms``.
-        result = self.backend.infer(bgr)
+        result = self.backend.infer(
+            bgr, self.score_threshold, self.iou_threshold,
+        )
         timings["preprocess"] = float(result["timings"]["preprocess_ms"])
         timings["inference"] = float(result["timings"]["inference_ms"])
         timings["postprocess"] = float(result["timings"]["postprocess_ms"])

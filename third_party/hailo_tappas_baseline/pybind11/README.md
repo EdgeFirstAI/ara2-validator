@@ -82,20 +82,19 @@ out in letterbox space, then per-mask unmap (`unmap_mask`) applies the inverse
 LetterboxMap to recover original-image coordinates. Boxes get the same
 treatment via a scale/clamp.
 
-## Hard-coded thresholds (upstream)
+## Hard-coded model parameters (upstream)
 
-The vendored postprocess source bakes:
+The vendored postprocess still hard-codes assumptions about the model itself,
+which is fine for a yolov8n/m-seg baseline but worth flagging:
 
-- `SCORE_THRESHOLD = 0.6f` (`instance_seg_postprocess.cpp:11`)
-- `IOU_THRESHOLD = 0.7f` (`instance_seg_postprocess.cpp:12`)
 - `NUM_CLASSES = 80` (`instance_seg_postprocess.cpp:13`)
 - `regression_length = 15` (DFL bins − 1 → 64ch boxes; `instance_seg_postprocess.cpp:614`)
 - `strides = {8, 16, 32}`, `network_dims = {640, 640}` (`instance_seg_postprocess.cpp:615-616`)
 
-These are baked because the comparison target *is* this exact code path. If we
-later want CLI parity with HAL's `--score-threshold` / `--iou-threshold`, the
-clean route is to patch `instance_seg_postprocess.cpp` to take the values as
-parameters and update `../README.md` (currently "verbatim, no modifications").
+Score and IoU thresholds **are** runtime-tunable; the shim's `infer()` accepts
+`score_threshold` and `iou_threshold` keyword arguments which forward to a
+local 5-arg overload of upstream's `filter()`. See `../README.md` for the
+diff against upstream.
 
 ## HEF compatibility caveat
 

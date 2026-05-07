@@ -15,8 +15,9 @@ decoder. It is not used in production inference paths.
 | Upstream license | MIT — see `LICENSE.upstream` |
 | Vendored on | 2026-05-06 |
 
-The `upstream/` subtree mirrors the upstream layout exactly so future syncs are a
-straightforward `cp -r` from a fresh clone. No upstream files were modified.
+The `upstream/` subtree mirrors the upstream layout. **One small set of
+modifications has been applied** to make benchmarking practical; see
+"Local modifications" below.
 
 ## Why vendor instead of submodule
 
@@ -92,6 +93,15 @@ Run against one of our v0.3.0 HEFs:
 > not from `edgefirst.json`. Before assuming it just works, dump the output
 > tensor names HailoRT enumerates for our HEF and confirm they match what
 > `instance_seg_postprocess.cpp` expects.
+
+## Local modifications
+
+| File | What changed | Why |
+|---|---|---|
+| `upstream/instance_segmentation/instance_seg_postprocess.{cpp,hpp}` | `SCORE_THRESHOLD` / `IOU_THRESHOLD` `#define`s renamed to `DEFAULT_*` and added a 5-arg `filter()` overload that threads runtime thresholds through `segmentation_postprocess` and `decode_boxes_and_extract_masks`. The original 3-arg `filter()` is preserved verbatim and now forwards to the 5-arg form with the upstream defaults. | The upstream sample bakes the thresholds at compile time. Validator-side benchmarking against pycocotools needs `score_threshold=0.001` (Ultralytics val convention) so the precision-recall curve can be integrated correctly; the bake-in would have produced under-reported mAP. The 3-arg overload is preserved so the GStreamer `hailofilter` element (which dlopens it by exact symbol) continues to resolve. |
+
+When syncing a future ACE update, re-apply this patch on top of the fresh
+upstream copy and update the row above with the new commit hash.
 
 ## Future work in this directory
 

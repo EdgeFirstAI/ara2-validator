@@ -8,8 +8,10 @@
 using namespace hailo_utils;
 using namespace xt::placeholders;
 
-#define SCORE_THRESHOLD 0.6f
-#define IOU_THRESHOLD 0.7f
+// Default thresholds preserved from upstream; the 4-arg `filter()` overload
+// declared in instance_seg_postprocess.hpp threads these through at runtime.
+#define DEFAULT_SCORE_THRESHOLD 0.6f
+#define DEFAULT_IOU_THRESHOLD 0.7f
 #define NUM_CLASSES 80
 
 std::vector<cv::Scalar> COLORS = {
@@ -430,7 +432,8 @@ std::vector<std::pair<HailoDetection, xt::xarray<float>>> decode_boxes_and_extra
                                                                                 xt::xarray<float> scores,
                                                                                 std::vector<int> network_dims,
                                                                                 std::vector<int> strides,
-                                                                                int regression_length) {
+                                                                                int regression_length,
+                                                                                float score_threshold = DEFAULT_SCORE_THRESHOLD) {
     int strided_width, strided_height, class_index;
     std::vector<std::pair<HailoDetection, xt::xarray<float>>> detections_and_masks;
     int instance_index = 0;
@@ -471,7 +474,7 @@ std::vector<std::pair<HailoDetection, xt::xarray<float>>> decode_boxes_and_extra
             class_index = xt::argmax(xt::row(scores, instance_index))(0);
             confidence = scores(instance_index, class_index);
             instance_index++;
-            if (confidence < SCORE_THRESHOLD)
+            if (confidence < score_threshold)
                 continue;
 
             xt::xarray<float> box(shape);
@@ -581,8 +584,10 @@ std::vector<DetectionAndMask> segmentation_postprocess(std::vector<HailoTensorPt
                                                                                 std::vector<int> strides,
                                                                                 int regression_length,
                                                                                 int num_classes,
-                                                                                int org_image_height, 
-                                                                                int org_image_width) {
+                                                                                int org_image_height,
+                                                                                int org_image_width,
+                                                                                float score_threshold = DEFAULT_SCORE_THRESHOLD,
+                                                                                float iou_threshold = DEFAULT_IOU_THRESHOLD) {
     std::vector<DetectionAndMask> detections_and_cropped_masks;
     if (tensors.size() == 0)
     {
@@ -597,10 +602,10 @@ std::vector<DetectionAndMask> segmentation_postprocess(std::vector<HailoTensorPt
     xt::xarray<float> proto = boxes_scores_masks_mask_matrix.proto_data;
 
     // Decode the boxes and get masks
-    auto detections_and_masks = decode_boxes_and_extract_masks(raw_boxes, raw_masks, scores, network_dims, strides, regression_length);
+    auto detections_and_masks = decode_boxes_and_extract_masks(raw_boxes, raw_masks, scores, network_dims, strides, regression_length, score_threshold);
 
     // Filter with NMS
-    auto detections_and_masks_after_nms = nms(detections_and_masks, IOU_THRESHOLD, true);
+    auto detections_and_masks_after_nms = nms(detections_and_masks, iou_threshold, true);
 
     // Decode the masking
     auto detections_and_decoded_masks = decode_masks(detections_and_masks_after_nms, proto, org_image_height, org_image_width);
@@ -608,7 +613,11 @@ std::vector<DetectionAndMask> segmentation_postprocess(std::vector<HailoTensorPt
     return detections_and_decoded_masks;
 }
 
-std::vector<cv::Mat> filter(HailoROIPtr roi, int org_image_height, int org_image_width)
+std::vector<cv::Mat> filter(HailoROIPtr roi,
+                            int org_image_height,
+                            int org_image_width,
+                            float score_threshold,
+                            float iou_threshold)
 {
     // anchor params
     int regression_length = 15;
@@ -616,13 +625,15 @@ std::vector<cv::Mat> filter(HailoROIPtr roi, int org_image_height, int org_image
     std::vector<int> network_dims = {640, 640};
 
     std::vector<HailoTensorPtr> tensors = roi->get_tensors();
-    auto filtered_detections_and_masks = segmentation_postprocess(tensors, 
-                                                            network_dims, 
-                                                            strides, 
-                                                            regression_length, 
-                                                            NUM_CLASSES, 
-                                                            org_image_height, 
-                                                            org_image_width);
+    auto filtered_detections_and_masks = segmentation_postprocess(tensors,
+                                                            network_dims,
+                                                            strides,
+                                                            regression_length,
+                                                            NUM_CLASSES,
+                                                            org_image_height,
+                                                            org_image_width,
+                                                            score_threshold,
+                                                            iou_threshold);
 
     std::vector<HailoDetection> detections;
     std::vector<cv::Mat> masks;
@@ -635,4 +646,12 @@ std::vector<cv::Mat> filter(HailoROIPtr roi, int org_image_height, int org_image
     hailo_common::add_detections(roi, detections);
 
     return masks;
+}
+
+// Original 3-arg overload preserved so the GStreamer hailofilter element
+// (which dlopens `filter(HailoROIPtr, int, int)`) still resolves correctly.
+std::vector<cv::Mat> filter(HailoROIPtr roi, int org_image_height, int org_image_width)
+{
+    return filter(roi, org_image_height, org_image_width,
+                  DEFAULT_SCORE_THRESHOLD, DEFAULT_IOU_THRESHOLD);
 }
