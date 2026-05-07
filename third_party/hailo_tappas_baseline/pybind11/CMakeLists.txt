@@ -47,8 +47,15 @@ ExternalProject_Add(xtensor-baseline
 pybind11_add_module(hailo_tappas_baseline
     hailo_pybind.cpp
     ${UPSTREAM_DIR}/instance_segmentation/instance_seg_postprocess.cpp
-    ${UPSTREAM_DIR}/common/toolbox.cpp
 )
+# NB: We deliberately do NOT compile upstream's common/toolbox.cpp.
+# It contains static-initializer globals (`GET_HEF_BASH_SCRIPT_PATH` and
+# `GET_INPUT_BASH_SCRIPT_PATH`) that walk the filesystem at module load
+# time looking for a `resources_download/scripts/` folder shipped with
+# the upstream sample app, and throw `runtime_error` if not found. The
+# postprocess source only uses toolbox.hpp's headers (HailoROI/Tensor
+# typedefs and `using namespace hailo_utils`), no actual functions, so
+# leaving toolbox.cpp out keeps `import hailo_tappas_baseline` clean.
 
 # Match upstream's permissive warning posture (their headers trigger several).
 target_compile_options(hailo_tappas_baseline PRIVATE

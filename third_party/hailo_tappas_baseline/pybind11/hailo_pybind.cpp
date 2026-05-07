@@ -20,7 +20,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -43,6 +45,51 @@ double ms_since(const clk::time_point &t0) {
     return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
 }
 
+// hailo-converter (>=0.1.x) appends a ZIP archive (edgefirst.json + labels.txt)
+// to the end of every produced .hef. HailoRT validates the file's total length
+// against the encoded protobuf size, so the trailing ZIP bytes have to be
+// trimmed before handing the buffer to ``VDevice::create_infer_model``.
+//
+// We parse the ZIP End-Of-Central-Directory record to locate the smallest
+// local-file-header offset; that is the original protobuf payload size.
+// Returns ``buffer.size()`` when no recognizable EOCD is present (e.g. a HEF
+// that was already stripped or never had a trailer).
+size_t locate_hef_payload_size(const std::vector<uint8_t> &buf) {
+    constexpr size_t EOCD_FIXED_SIZE = 22;
+    constexpr uint32_t EOCD_SIG = 0x06054b50;  // "PK\x05\x06"
+    constexpr uint32_t CD_SIG   = 0x02014b50;  // "PK\x01\x02"
+    if (buf.size() < EOCD_FIXED_SIZE) return buf.size();
+
+    // EOCD comment field is 0..65535 bytes, so the signature lies within
+    // the last ~64KB. Scan that window for the EOCD magic.
+    const size_t max_scan = std::min(buf.size(), size_t(EOCD_FIXED_SIZE + 65535));
+    for (size_t back = EOCD_FIXED_SIZE; back <= max_scan; ++back) {
+        const size_t i = buf.size() - back;
+        uint32_t sig;
+        std::memcpy(&sig, buf.data() + i, 4);
+        if (sig != EOCD_SIG) continue;
+
+        // EOCD layout: at +16 is offset of central directory (4 bytes LE).
+        uint32_t cd_offset;
+        std::memcpy(&cd_offset, buf.data() + i + 16, 4);
+        if (cd_offset == 0 || cd_offset > buf.size() - 4) return buf.size();
+        uint32_t cd_sig;
+        std::memcpy(&cd_sig, buf.data() + cd_offset, 4);
+        if (cd_sig != CD_SIG) return buf.size();
+
+        // First central directory entry: at +42 is the relative offset of the
+        // first local file header (4 bytes LE). That offset == start of the
+        // appended ZIP region == end of the HEF protobuf payload.
+        if (cd_offset + 46 > buf.size()) return buf.size();
+        uint32_t local_header_offset;
+        std::memcpy(&local_header_offset, buf.data() + cd_offset + 42, 4);
+        if (local_header_offset == 0 || local_header_offset >= buf.size())
+            return buf.size();
+        return local_header_offset;
+    }
+    return buf.size();
+}
+
 // Aspect-preserving letterbox: scale to fit (longest side matches model dim),
 // pad bottom and right with zeros. Matches the upstream
 // `make_model_space_canvas` semantics (instance_seg_postprocess.cpp:120).
@@ -54,14 +101,9 @@ double ms_since(const clk::time_point &t0) {
 // is the function the upstream code itself uses to undo the geometry on the
 // postprocess side, so using it on both sides keeps preprocess and postprocess
 // consistent.
-struct LetterboxMap {
-    float factor{1.0f};
-    int pad_h{0};
-    int pad_w{0};
-    int crop_h{0};   // valid (non-padded) region of the letterboxed canvas
-    int crop_w{0};
-};
-
+//
+// `LetterboxMap` is defined in instance_seg_postprocess.hpp (we use the
+// upstream's struct rather than redeclaring our own).
 cv::Mat letterbox_for_model(const cv::Mat &src,
                             int model_w, int model_h,
                             LetterboxMap &map)
@@ -112,12 +154,31 @@ cv::Mat unmap_mask(const cv::Mat &mask_model_space,
 class HailoTappasBackend {
 public:
     explicit HailoTappasBackend(const std::string &hef_path) {
+        // Slurp the file and trim the hailo-converter ZIP trailer (if any)
+        // before handing the buffer to HailoRT. We keep the trimmed copy
+        // alive as a member because create_infer_model's MemoryView overload
+        // does not take ownership of the bytes it parses.
+        {
+            std::ifstream f(hef_path, std::ios::binary);
+            if (!f) throw std::runtime_error("cannot open HEF: " + hef_path);
+            f.seekg(0, std::ios::end);
+            const auto sz = static_cast<std::streamoff>(f.tellg());
+            f.seekg(0, std::ios::beg);
+            std::vector<uint8_t> raw(static_cast<size_t>(sz));
+            f.read(reinterpret_cast<char *>(raw.data()), sz);
+            if (!f) throw std::runtime_error("short read on HEF: " + hef_path);
+            const size_t payload = locate_hef_payload_size(raw);
+            raw.resize(payload);
+            hef_buffer_ = std::move(raw);
+        }
+
         auto vd = VDevice::create();
         if (!vd) throw std::runtime_error(
             "VDevice::create failed: " + std::to_string(vd.status()));
         vdevice_ = std::move(vd.value());
 
-        auto im = vdevice_->create_infer_model(hef_path);
+        auto im = vdevice_->create_infer_model(
+            MemoryView(hef_buffer_.data(), hef_buffer_.size()));
         if (!im) throw std::runtime_error(
             "create_infer_model failed: " + std::to_string(im.status()));
         infer_model_ = im.value();
@@ -167,12 +228,21 @@ public:
             py::gil_scoped_release release;
 
             // ----- 1. Preprocess: BGR view -> RGB -> letterbox -----
+            //
+            // Each step (cvtColor, resize, copyMakeBorder) is documented as
+            // eager, but OpenCV's fast paths can skip the actual write under
+            // certain conditions (e.g. resize with src.size == dst.size, or
+            // a stride-shifted output that aliases the input). To prevent a
+            // timer that stops before the data has actually landed, we force
+            // a final clone(). It's an O(N) memcpy so it both materializes
+            // any deferred kernel work and guarantees HailoRT receives a
+            // fresh, contiguous buffer it can DMA directly.
             auto t_pre = clk::now();
             cv::Mat src_bgr(org_h, org_w, CV_8UC3, buf.ptr);   // zero-copy view
             cv::Mat rgb;
             cv::cvtColor(src_bgr, rgb, cv::COLOR_BGR2RGB);
             cv::Mat letterboxed = letterbox_for_model(rgb, model_w_, model_h_, lbmap);
-            if (!letterboxed.isContinuous()) letterboxed = letterboxed.clone();
+            letterboxed = letterboxed.clone();   // materialization barrier
             pre_ms = ms_since(t_pre);
 
             // ----- 2. Bind buffers + run sync inference -----
@@ -318,6 +388,7 @@ public:
     }
 
 private:
+    std::vector<uint8_t> hef_buffer_;     // owns bytes referenced by InferModel
     std::unique_ptr<VDevice> vdevice_;
     std::shared_ptr<InferModel> infer_model_;
     std::unique_ptr<ConfiguredInferModel> cfg_;
