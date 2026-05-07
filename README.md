@@ -141,6 +141,69 @@ At deployment threshold (0.5, ~1–4 detections): mean **3.7 ms**, max **8.7 ms*
 > viewable at [ui.perfetto.dev](https://ui.perfetto.dev/). Tracing adds < 1%
 > overhead (single atomic load per span site when no subscriber is active).
 
+### rpi5-hailo (Hailo-8L) — TAPPAS reference vs HAL
+
+Same harness, different target: Raspberry Pi 5 + Hailo-8L (M.2 AI Kit). The `hailo` backend wraps Hailo's vendored C++ TAPPAS instance-segmentation reference (in `third_party/hailo_tappas_baseline/`) for the apples-to-apples vendor baseline; the `hal-hailo` backend pairs HailoRT NPU compute with HAL preprocess + decode + mask materialisation.
+
+> [!IMPORTANT]
+> The Hailo and Ara240 numbers in this README are **not directly comparable across NPUs**. The HEFs and DVMs come from different training checkpoints (`yolov8n-seg-latest-t-264d` for Hailo vs `yolov8n-seg-kinara-1.2.1` for Ara240) — base-model accuracy differs, the int8 calibration differs, and the per-target compilation differs. The valid comparisons are *within* a target: TAPPAS vs HAL+Hailo on the same HEF on Hailo, and `dvapi` vs HAL on the same DVM on Ara240.
+
+#### NPU output structure: 4 tensors (Ara240) vs 10 tensors (Hailo)
+
+The two NPUs leave very different amounts of work for the host:
+
+| | Ara240 | Hailo-8/8L |
+|---|---|---|
+| Output tensor count | **4** | **10** |
+| Boxes | 1 tensor `[1, 4, 8400]` (already DFL-decoded + concatenated on chip) | 3 tensors `[1, 80/40/20, 80/40/20, 64]` — raw DFL bins per FPN level |
+| Scores | 1 tensor `[1, 80, 8400]` | 3 tensors per FPN level (sigmoid often DFC-fused) |
+| Mask coefficients | 1 tensor `[1, 32, 8400]` | 3 tensors per FPN level |
+| Protos | 1 tensor `[1, 32, 160, 160]` | 1 tensor `[1, 160, 160, 32]` (NHWC) |
+| Host-side work | Dequant + score filter + NMS + matmul | DFL decode + per-scale dequant + score filter + NMS + matmul |
+
+The Ara240 path runs on-chip box-DFL decode and concatenation; Hailo leaves both as host work, in exchange for a smaller compiled graph and fewer post-NPU tensor moves. This means the postprocess columns below carry roughly 30% more host work than the Ara240 numbers — most of which goes into the per-scale DFL decode HAL's per-scale Decoder absorbs. It also means schema-driven decoding is mandatory on Hailo: the embedded `edgefirst.json` (schema-v2, written by hailo-converter v0.3.0+) tells HAL which of the 10 raw tensors holds which role and which scale level.
+
+#### coco128-seg per-stage timing
+
+Both threshold tables run the **same HEF** on the **same Hailo-8L**; only the postprocess implementation differs. Pre / Inf / nms_decode / mask are end-to-end-relevant; image decode and output formatting (RLE) are reported separately.
+
+##### Validation threshold (`--score-threshold 0.001`)
+
+| Backend | Box mAP | Box mAP@50 | Mask mAP | Mask mAP@50 | Pre | Inf | nms_decode | mask | End-to-end |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `hailo` (TAPPAS reference) | 0.2764 | 0.4202 | 0.2026 | 0.3587 | 0.86 ms | 15.74 ms | — fused 1034.32 ms — | | **1050.94 ms** |
+| `hal-hailo` (HAL) | **0.3965** | **0.5442** | **0.3187** | **0.4934** | 2.24 ms | 16.46 ms | 9.05 ms | 1.72 ms | **29.48 ms** |
+
+##### Deployment threshold (`--score-threshold 0.5`)
+
+| Backend | Box mAP | Box mAP@50 | Mask mAP | Mask mAP@50 | Pre | Inf | nms_decode | mask | End-to-end |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `hailo` (TAPPAS reference) | **0.2855** | **0.3461** | 0.1784 | 0.3130 | 0.94 ms | 15.73 ms | — fused 48.77 ms — | | **65.46 ms** |
+| `hal-hailo` (HAL) | 0.2474 | 0.3076 | **0.2160** | 0.2997 | 2.23 ms | 16.42 ms | 8.82 ms | 0.62 ms | **28.10 ms** |
+
+Three things stand out:
+
+1. **HAL preprocess is slightly slower than OpenCV here, not faster.** OpenCV's `cv2.resize` on the RPi5's Cortex-A76 with NEON is ~0.9 ms; HAL's GPU letterbox + map back to a HailoRT-managed numpy buffer is ~2.2 ms. The cross-domain memcpy at the GPU↔HailoRT-host boundary is unavoidable on this hardware: unlike Ara240 where the V3D GPU and the NPU share a DMA-BUF pool (so HAL writes the NPU input buffer directly), the Hailo NPU's host buffers are managed by HailoRT independently of the GPU. HAL still runs the resize, but the result has to be copied. Where HAL pulls ahead is when preprocess size is bigger than 640×640 (1080p input is ~5–6× faster on HAL than OpenCV), which is the typical camera path.
+
+2. **HAL nms_decode is dramatically faster at the validation threshold.** At `0.001`, TAPPAS's postprocess balloons to 1034 ms / frame (1.0 FPS) because its NMS is naive O(N²) over candidates; HAL's per-scale Decoder uses indexed top-K + class-aware NMS in compiled Rust and stays at ~9 ms regardless of threshold. Same NPU output, same model, same boxes — fundamentally different scaling.
+
+3. **Box mAP@0.5:0.95 at the deploy threshold is *higher* on TAPPAS than on HAL+Hailo (0.286 vs 0.247).** This is *not* an accuracy regression — at validation threshold (the proper measurement) HAL wins by +12 percentage points (0.397 vs 0.276). What you're seeing at `0.5` is HAL's per-scale Decoder filtering more aggressively at the score check, dropping medium-confidence boxes that would have survived TAPPAS's looser filter and contributed to recall in pycocotools' integration. With the truncated P-R curve at `0.5`, retaining more medium-confidence detections looks like accuracy. With the full curve at `0.001`, the actual ranking is unambiguous — see [Why `0.001`?](#coco128--per-stage-timing-128-images) above.
+
+#### coco-val5k (5000 images, rpi5-hailo)
+
+Same HEF, same Hailo-8L, same val convention (`score_threshold=0.001`). Drift columns are HAL+Hailo minus TAPPAS reference, in absolute percentage points.
+
+| Backend | Box mAP | Box mAP@50 | Mask mAP | Mask mAP@50 | Mask mAR@100 | End-to-end | Throughput |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `hailo` (TAPPAS reference) | 0.2164 | 0.3419 | 0.1704 | 0.3046 | 0.3575 | 1218.32 ms | 0.8 FPS |
+| `hal-hailo` (HAL) | **0.3306** | **0.4744** | **0.2768** | **0.4461** | **0.3794** | **29.65 ms** | **33.7 FPS** |
+| **drift (pp)** | **+11.42** | +13.25 | **+10.64** | +14.15 | +2.19 | — | **41×** |
+
+End-to-end column is `model-path` (preprocess + inference + nms_decode + mask), excluding image decode and pycocotools RLE encoding so the row is comparable to the Ara240 val5k numbers. The 41× throughput gap on val5k is dominated by TAPPAS NMS cost at high candidate counts (~76 anchors per cell pass the 0.001 score gate); the same workload on `hal-hailo` runs at the same speed as the deploy-threshold workload because HAL's NMS scales linearly in kept candidates after the top-K cut.
+
+> [!NOTE]
+> The Hailo TAPPAS reference (`hailo` backend) is the upstream-faithful Hailo Application Code Examples postprocess vendored under `third_party/hailo_tappas_baseline/` at MIT licence. The vendored copy includes a small local patch to thread runtime score/IoU thresholds through the `filter()` call so we can run pycocotools' `0.001` convention; the original is `#define`-baked at deploy thresholds. See `third_party/hailo_tappas_baseline/README.md` for provenance and the diff.
+
 ### What "end-to-end" measures
 
 `End-to-end` covers the per-frame work after image acquisition:
@@ -472,16 +535,17 @@ The `edgefirst` path differs from the `reference` path in three places:
 
 ### Capability matrix
 
-| | `onnx_reference` | `reference` | `edgefirst` |
-|---|---|---|---|
-| Device | PC / any CPU, or on-target | imx8mp-frdm, imx95-frdm | imx8mp-frdm, imx95-frdm |
-| Runtime | ONNX Runtime | dvapi → libaraclient | edgefirst-ara2 → libaraclient |
-| Preprocess | cv2 (CPU) | cv2 + int8 quant (CPU) | HAL GPU (DMA-BUF) |
-| Decode | numpy (CPU) | numpy + dequant (CPU) | HAL Decoder (Rust) |
-| Mask decode | numpy retina or process_mask | numpy retina or process_mask | HAL `materialize_masks` (Scaled or Proto) |
-| Box eval | ✅ bbox | ✅ bbox | ✅ bbox |
-| Mask eval | ✅ segm | ✅ segm | ✅ segm |
-| NPU sub-timings | — | ✅ DMA + NPU | ✅ DMA + NPU |
+| | `onnx_reference` | `reference` (`numpy`) | `edgefirst` (`hal`) | `hailo` | `hal-hailo` |
+|---|---|---|---|---|---|
+| Category | reference | reference | EdgeFirst | reference | EdgeFirst |
+| Device | PC / any CPU, or on-target | imx8mp-frdm, imx95-frdm | imx8mp-frdm, imx95-frdm | rpi5 + Hailo-8/8L | rpi5 + Hailo-8/8L |
+| Runtime | ONNX Runtime | dvapi → libaraclient | edgefirst-ara2 → libaraclient | HailoRT | HailoRT |
+| Preprocess | cv2 (CPU) | cv2 + int8 quant (CPU) | HAL GPU (DMA-BUF) | cv2 (CPU) | HAL GPU + memcpy |
+| Decode | numpy (CPU) | numpy + dequant (CPU) | HAL Decoder (Rust) | TAPPAS (vendored C++) | HAL Decoder (Rust) |
+| Mask decode | numpy retina or process_mask | numpy retina or process_mask | HAL `materialize_masks` (Scaled or Proto) | TAPPAS (vendored C++) | HAL `materialize_masks` |
+| Box eval | ✅ bbox | ✅ bbox | ✅ bbox | ✅ bbox | ✅ bbox |
+| Mask eval | ✅ segm | ✅ segm | ✅ segm | ✅ segm | ✅ segm |
+| NPU sub-timings | — | ✅ DMA + NPU | ✅ DMA + NPU | — | — |
 
 ### Model format
 
@@ -497,6 +561,17 @@ The Ara240 DVM (`yolov8n-seg-kinara-1.2.1.dvm`) uses a **split-decoder** output 
 | `boxes` | [1, 4, 8400] | int16 | Box coordinates (xcycwh) |
 
 Other DVMs (e.g. from EdgeFirst Studio sessions) may split boxes into separate xy `[1, 2, 8400]` and wh `[1, 2, 8400]` tensors with independent quantisation parameters. Both formats are handled automatically.
+
+The Hailo HEF (`yolov8n-seg-*.hef`, produced by [hailo-converter](https://github.com/EdgeFirstAI/hailo-converter) v0.3.0+) emits **10 raw output tensors** with no on-chip box decode:
+
+| Tensor (per FPN level) | Shape | Dtype | Description |
+|---|---|---|---|
+| `boxes_{0,1,2}` | `[1, 80, 80, 64]`, `[1, 40, 40, 64]`, `[1, 20, 20, 64]` | uint8 | Raw DFL bins (4 coords × 16 bins) |
+| `scores_{0,1,2}` | `[1, 80, 80, 80]`, `[1, 40, 40, 80]`, `[1, 20, 20, 80]` | uint8 | Per-class logits or post-sigmoid (DFC may fuse the sigmoid into the conv) |
+| `mask_coefs_{0,1,2}` | `[1, 80, 80, 32]`, `[1, 40, 40, 32]`, `[1, 20, 20, 32]` | uint8 | Mask prototype weights |
+| `protos` | `[1, 160, 160, 32]` | uint8 | Mask prototype spatial basis (NHWC) |
+
+Tensor → role binding is driven by an embedded `edgefirst.json` (schema-v2) ZIP-trailed onto the HEF; HAL's per-scale Decoder reads it on construction and routes each tensor to the right dequant/decode path. The `hailo-converter` repo's `output_metadata.py` is the source of truth for that schema's wire format.
 
 ## Mask materialisation modes
 
