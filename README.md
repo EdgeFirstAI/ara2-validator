@@ -1,20 +1,32 @@
-# Ara240 Validator
+# HAL Validator (`ara2-validator`)
 
-> **YOLOv8-seg COCO validation on the NXP Ara240 NPU, end-to-end.** Three reference inference paths (FP32 ONNX host, dvapi+opencv on-target, EdgeFirst HAL on-target) producing pycocotools-evaluated COCO JSON, with per-stage timings on each.
+> **A rudimentary harness for Ultralytics YOLO segmentation validation,** comparing **vendor-/upstream-faithful reference pipelines** against **EdgeFirst HAL-optimized pipelines** on the same model and same hardware. Per-stage timings paired with pycocotools mAP, on every backend.
 
-| | What it shows | Where it runs |
-|---|---|---|
-| **`onnx_reference`** | FP32 ONNX accuracy ceiling | any CPU/CUDA host, or on-target |
-| **`reference`** | int8 NPU baseline using NXP dvapi.py + OpenCV | imx8mp-frdm, imx95-frdm |
-| **`edgefirst`** | int8 NPU + GPU letterbox + HAL Decoder | imx8mp-frdm, imx95-frdm |
+| Pipeline | Category | What it represents | Where it runs |
+|---|---|---|---|
+| `onnx_reference` | reference | Ultralytics FP32 host baseline (accuracy ceiling) | any CPU/CUDA host, or on-target |
+| `reference` (`--backend numpy`) | reference | NXP `dvapi.py` + OpenCV/NumPy on Ara240 | imx8mp-frdm, imx95-frdm |
+| `hailo` (`--backend hailo`) | reference | Hailo TAPPAS reference postprocess | RPi5 + Hailo-8/8L |
+| `edgefirst` (`--backend hal`) | EdgeFirst | HAL on Ara240 — DMA-BUF zero-copy GPU↔NPU | imx8mp-frdm, imx95-frdm |
+| `--backend hal-hailo` | EdgeFirst | HAL on Hailo — GPU letterbox + HAL Decoder | RPi5 + Hailo-8/8L |
 
-This validator augments the NXP-supplied dvapi reference with EdgeFirst HAL acceleration: GPU letterbox preprocessing rendered directly into the NPU input buffer, detection decode and mask materialisation in compiled Rust, all sharing the dvproxy DMA-BUF surface for zero-copy data movement. It is an **offline benchmarking + validation tool**, not a production streaming application — each pipeline stage runs serially so per-stage cost is captured cleanly. For live camera/video inference with EdgeFirst, see the [ara2-rs examples](https://github.com/EdgeFirstAI/ara2-rs/tree/main/examples).
+The repo started life as `ara2-validator` (NXP Ara240 only, hence the package name) and has grown into the validation harness for EdgeFirst HAL across multiple NPU targets — Ara240 today, Hailo on Raspberry Pi 5 today, more to come. The reference pipelines stay faithful to upstream Ultralytics + the target's vendor SDK with no EdgeFirst components in the path; the HAL-optimized pipelines swap in `edgefirst-hal` for preprocess + decode + masks. Both regimes report the same per-stage timings and the same pycocotools mAP, so the cost (in milliseconds) and benefit (in mAP points) of adopting HAL on each target is directly readable off the same table.
 
 ## Scope of this demonstration
 
-This repository validates **a single model (YOLOv8n-seg) on a single NPU (NXP Ara240) for a single task (COCO instance segmentation)**.
+This repository validates **YOLO instance-segmentation models on supported NPUs for COCO instance segmentation** as an example workflow. It is deliberately small in scope: one task, one model family, a handful of targets — enough to make the comparison concrete, not so much that the takeaways get lost.
 
-For multi-model, multi-sensor, multi-platform productisation — data labelling, training, deployment, and OTA at fleet scale — see **[EdgeFirst Studio](https://edgefirst.studio/)**. Studio ships these workflows end-to-end and supports target hardware beyond Ara240 (i.MX 8M Plus, i.MX 95, Raspberry Pi + Hailo, NVIDIA Jetson) with first-class support for radar, lidar, and camera fusion.
+For multi-model, multi-sensor, multi-platform productisation — data labelling, training, deployment, and OTA at fleet scale — see **[EdgeFirst Studio](https://edgefirst.studio/)**. Studio ships these workflows end-to-end and supports target hardware beyond what is shown here (i.MX 8M Plus, i.MX 95, Raspberry Pi + Hailo, NVIDIA Jetson) with first-class support for radar, lidar, and camera fusion.
+
+## Why per-stage, why serial
+
+The validator runs every pipeline **synchronously, one frame at a time, one stage at a time**. This is intentional and load-bearing.
+
+- **Per-stage attribution requires no overlap.** If preprocess overlaps with the previous frame's NPU inference, the "preprocess time" you measure silently includes scheduling jitter from the earlier inference. The numbers stop being additive and the comparison becomes circular.
+- **Concurrent pipelining improves throughput, not latency.** Every modern inference framework (HailoRT, TAPPAS GStreamer, ONNX Runtime, EdgeFirst HAL itself) supports overlapping stages across consecutive frames; the result is higher FPS for video workloads. **Per-frame latency is unchanged or slightly worse** (extra queueing, deeper buffer chains, scheduler jitter). Adopting pipelining to make a benchmark look better is trading an honest measurement for an optimistic one — and the wrong one for any latency-critical application (closed-loop control, AR overlays, robotics).
+- **We are checking the trade between accuracy and performance.** Pairing per-stage timings with pycocotools mAP is the only way to tell whether a "faster" pipeline is faster because the work moved to better hardware, or faster because it skipped work that was actually needed. Without the per-stage breakdown the trade is invisible; without the mAP numbers it is incomplete.
+
+For the canonical live-pipeline pattern with stages overlapped for throughput, see [`ara2-rs/examples/yolov8_live.py`](https://github.com/EdgeFirstAI/ara2-rs/blob/main/examples/yolov8_live.py) (Ara240) or the Hailo TAPPAS GStreamer apps. Those are the deployment shape; **this repo is the measurement shape**, and the two should not be conflated.
 
 ## Results
 
@@ -34,6 +46,9 @@ The full COCO val2017 set. Drift columns are absolute **percentage points** (`mA
 ### coco128 — per-stage timing (128 images)
 
 All scripts run on-target so the per-stage timings are directly comparable. Two tables are shown: the first uses a **validation** score threshold of `0.001` (required for correct mAP computation — see note below); the second uses a **deployment** threshold of `0.5`, representative of real-time inference.
+
+> [!IMPORTANT]
+> Every row below is a **synchronous, single-frame-in-flight** measurement. No double-buffering, no async dispatch, no batched inference, no concurrent stages. This is on purpose — the per-stage breakdown is what makes a "faster" pipeline distinguishable from a *less accurate* pipeline, and any overlap silently rolls a stage's true cost into its neighbour's column. See [Serial vs concurrent pipelines](#serial-vs-concurrent-pipelines) for what the same pipelines look like under throughput-tuned scheduling, and why we don't quote those numbers.
 
 > [!IMPORTANT]
 > **Decode and Mask timings are strongly threshold-dependent.** At the validation threshold of `0.001`, the model retains ~100–300 candidate detections per frame for decode and ~5–15 surviving detections for mask materialisation. At a deployment threshold of `0.5`, only ~2–5 high-confidence detections survive, and both Decode and Mask drop accordingly. The validation table represents a worst-case timing bound; the deployment table represents real-world performance.
@@ -158,7 +173,7 @@ For the canonical live-pipeline pattern (camera → NPU → fused draw_masks →
 
 ## Serial vs concurrent pipelines
 
-The end-to-end numbers above come from a **serial** execution model: each stage runs to completion before the next begins, one frame at a time. That is what makes the per-stage breakdown additive — the total is exactly the sum of the parts, with no overlap to disentangle, which is the entire point of a benchmarking + validation tool.
+The end-to-end numbers in this README come from a **serial** execution model: each stage runs to completion before the next begins, one frame at a time. That is what makes the per-stage breakdown additive — the total is exactly the sum of the parts, with no overlap to disentangle. **This is the entire point of the validator** and the reason it is not a deployment example.
 
 ![Serial pipeline timeline](assets/diagram_serial_execution.png)
 
@@ -170,7 +185,17 @@ A throughput-tuned deployment can overlap stages across consecutive frames — s
 
 ![Concurrent pipeline](assets/diagram_pipeline_overlap.png)
 
-Per-frame **latency** is unchanged. Any one frame still has to walk through every stage in order, and the end-to-end clock from sensor capture to rendered output is identical to the serial case. Concurrent pipelining is therefore a *throughput* optimisation; it does not make any individual frame complete faster, which is why latency-critical paths (closed-loop control, AR overlays) cannot escape the per-stage budget by adding parallelism. Implementing the concurrent pipeline is out of scope for this validator — overlap would obscure the per-stage attribution this tool exists to capture — but the pattern is documented in the EdgeFirst HAL and `ara2-rs` examples.
+### Throughput vs latency, and why we measure latency
+
+Per-frame **latency** is unchanged by pipelining. Any one frame still has to walk through every stage in order, and the end-to-end clock from sensor capture to rendered output is identical to — sometimes a few milliseconds *worse than* — the serial case, because adding queueing between stages introduces scheduler jitter and deeper buffer chains. Concurrent pipelining is a *throughput* optimisation: it gets you more frames per second on a video stream by hiding cheap stages behind the slowest one. It does not make any individual frame complete faster.
+
+That distinction matters because *most* of the work this repo is meant to inform — closed-loop control, AR overlays, robotics, automotive perception — is latency-critical, not throughput-critical. Optimizing the slowest stage (typically NPU inference) lifts both the throughput ceiling *and* the per-frame latency floor; optimizing for throughput by overlapping stages lifts only the ceiling. We measure latency directly because that is the budget the application actually runs against.
+
+This is also why we don't quote pipelined "FPS" numbers. Every framework here — HailoRT, TAPPAS GStreamer, ONNX Runtime, EdgeFirst HAL — has documented async / batched / multi-stream APIs that can be used to push throughput well past the serial number. Quoting them would make the comparison framework-shopping (whose async machinery is most aggressive?) instead of comparison-of-stages (whose preprocess is fastest? whose decode? whose mask?). The serial number is the honest one because every framework can hit it identically with synchronous code.
+
+### Why this validator is intentionally not a deployment example
+
+Implementing the concurrent pipeline is out of scope for this validator on purpose: overlap would obscure the per-stage attribution this tool exists to capture, and the resulting numbers would no longer answer the question we are asking. If a benchmark in this repo ever silently pipelines, please file an issue — it is a bug, not a feature. For the deployment-shaped pattern (camera → NPU → fused render), follow the EdgeFirst HAL [Optimization Guide](https://github.com/EdgeFirstAI/hal#optimization-guide) and the `ara2-rs` / Hailo TAPPAS GStreamer example apps; those are the right places to learn the production shape.
 
 ### How the validator pipeline mirrors deployment
 
@@ -551,7 +576,7 @@ python -m ara2_validator.edgefirst \
 
 **Validation threshold inflates postprocess.** `--score-threshold 0.001` matches Ultralytics `val` defaults and produces a complete precision-recall curve; a deployment would use `~0.50` and see substantially fewer surviving detections per frame. See [Deployment-style timing](#deployment-style-timing).
 
-**Serial pipeline.** Each stage runs serially to capture accurate per-stage timing. An optimised deployment can overlap preprocessing of frame *N+1* with inference of frame *N*, increasing throughput (gated by the slowest stage) without reducing per-frame latency. The validator does not implement this.
+**Serial pipeline — a deliberate choice.** Each stage runs to completion before the next begins, one frame at a time. Concurrent / pipelined execution increases video *throughput* by overlapping stages across consecutive frames; it does not reduce per-frame *latency* and frequently increases it slightly via queueing and scheduler jitter. The validator measures latency directly, paired with pycocotools mAP, so a "faster" pipeline cannot hide accuracy loss behind throughput gains. See [Serial vs concurrent pipelines](#serial-vs-concurrent-pipelines).
 
 **Outlier filter.** All timing values are reported as min/mean/max after filtering the top and bottom 1% outliers (one sample on each side of a 128-image run). On-target benchmarks see occasional spikes from cgroup CPU pressure, dvproxy stalls, and GPU driver warmup — trimming suppresses those without losing the mean.
 
