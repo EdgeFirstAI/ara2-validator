@@ -43,32 +43,67 @@ does), wrap it in a synchronous shim that runs one frame to completion before
 returning, and document the wrapping. The numbers in the README are what users
 believe; making them wrong is the worst thing this repo can do.
 
-## What "reference" means here
+## Three concepts, three terms — use them consistently
 
-A *reference* pipeline is the apples-to-apples baseline a customer would land
-on if they followed the upstream Ultralytics + vendor SDK documentation
-verbatim, with no EdgeFirst components. Our reference pipelines are:
+The README, the docstrings, and these instructions all use the same three-tier
+language. **Don't invent synonyms.** Every PR description and every commit
+message should pick from this vocabulary verbatim:
 
-| Backend        | What it represents                                                | Pre              | Inference   | Post           |
-|----------------|-------------------------------------------------------------------|------------------|-------------|----------------|
-| `onnx`         | Ultralytics FP32 host baseline (defines the accuracy ceiling)     | OpenCV CPU       | ONNX Runtime| Ultralytics    |
-| `numpy`        | NXP dvapi.py + OpenCV/NumPy on Ara240 (vendor reference)          | OpenCV CPU       | dvapi NPU   | NumPy + cv2    |
-| `hailo`        | Hailo TAPPAS reference postprocess on Hailo-8/8L (vendor reference)| OpenCV CPU      | HailoRT NPU | TAPPAS C++     |
+- **Reference model** — the Ultralytics ONNX FP32 export. Treated as
+  effectively lossless from the original PyTorch checkpoint. Defines the
+  accuracy ceiling; absolute mAP values from this row are what every NPU
+  number is reported relative to. Run on a host CPU/CUDA box, not on-target.
+  **Per-stage timing for the reference model is not reported** — the question
+  this repo asks is on-target latency, and host CPU latency would only confuse
+  the comparison. The `onnx_reference` script produces this row.
+- **Reference pipeline** — the NPU run via the vendor's documented
+  integration. The shape is **NPU + vendor SDK (e.g. TAPPAS for Hailo, dvapi
+  for Ara240) + OpenCV/NumPy** for whatever the SDK doesn't cover (preprocess
+  on every target; postprocess on Ara240, where the SDK ships no postprocess
+  library). One reference pipeline per target — the customer-facing "what you
+  get out of the box" path. Backends: `numpy` (Ara240 dvapi + opencv), `hailo`
+  (Hailo TAPPAS C++ postprocess + opencv preprocess).
+- **EdgeFirst pipeline** — the *same NPU model* run through `edgefirst-hal` for
+  preprocessing, detection decode, NMS, and mask materialisation. Same NPU
+  bytes, same compiled graph, same int8 quantisation; only the host-side
+  software around the NPU changes. Backends: `hal` (Ara240), `hal-hailo`
+  (Hailo).
 
-All three use the same Ultralytics-faithful letterbox geometry, the same NMS
-parameters (score 0.001 / IoU 0.7 / max_det 300 for `val`, 0.5 / 0.7 / 300 for
-deploy), and the same pycocotools eval harness. Only the implementations differ.
+| Backend        | Concept            | Pre        | Inference         | Post                |
+|----------------|--------------------|------------|-------------------|---------------------|
+| `onnx_reference` | reference model    | OpenCV CPU | ONNX Runtime      | Ultralytics         |
+| `numpy`        | reference pipeline | OpenCV CPU | dvapi NPU         | NumPy + cv2         |
+| `hailo`        | reference pipeline | OpenCV CPU | HailoRT NPU       | TAPPAS C++          |
+| `hal`          | EdgeFirst pipeline | HAL GPU    | edgefirst-ara2 NPU| HAL Decoder + masks |
+| `hal-hailo`    | EdgeFirst pipeline | HAL GPU    | HailoRT NPU       | HAL Decoder + masks |
 
-A *HAL-optimized* pipeline is what EdgeFirst ships:
+All five paths use the same Ultralytics-faithful letterbox geometry, the same
+NMS parameters (score 0.001 / IoU 0.7 / max_det 300 for `val`; 0.5 / 0.7 / 300
+for deploy), and the same pycocotools eval harness. The two EdgeFirst pipelines
+share the **same** HAL Decoder (Rust per-scale subsystem) and **same** mask
+materialiser; only the inference engine differs.
 
-| Backend        | What it represents                                  | Pre        | Inference   | Post                  |
-|----------------|------------------------------------------------------|------------|-------------|-----------------------|
-| `hal`          | HAL on Ara240 (DMA-BUF zero-copy GPU↔NPU)           | HAL GPU    | edgefirst-ara2 NPU | HAL Decoder + masks   |
-| `hal-hailo`    | HAL on Hailo-8/8L (GPU letterbox, no shared DMA-BUF)| HAL GPU    | HailoRT NPU | HAL Decoder + masks   |
+### Drift columns are vs the reference model, always
 
-The HAL paths use the **same** HAL Decoder (Rust per-scale subsystem) and **same**
-mask materializer; only the inference engine differs. This is why the HAL
-postprocess column is comparable across NPUs — the same code runs on each.
+When adding a new backend or platform, the absolute mAP column goes next to a
+"Δ pp vs FP32" drift number. The drift is computed against the reference-model
+row at the top of the same table — never against another NPU pipeline, never
+against another platform. Within-target accuracy comparison is then a quick
+read of two drift numbers (reference pipeline vs EdgeFirst pipeline on the same
+NPU).
+
+### HAL preprocess uses the GPU, OpenCV uses the CPU
+
+The 1–2 ms wall-clock difference between OpenCV preprocess and HAL preprocess
+at 640×640 input is not a HAL slowdown — HAL runs on the platform GPU (V3D on
+RPi5, Vivante on i.MX) so the CPU is free for the host-side decode + NMS that
+follows. OpenCV runs on the CPU and contends with the same cores the
+postprocess will need. At larger camera resolutions (1080p input → 640×640
+model) HAL beats OpenCV on wall-clock as well. We report only the canonical
+EdgeFirst pipeline (HAL pre + HAL post) and the canonical reference pipeline
+(vendor pre + vendor post) — not the cross combinations. A user who wants HAL
+post with OpenCV pre, or vice versa, can wire it from
+`ara2_validator/preprocess.py` + `ara2_validator/postprocess_hal.py`.
 
 ## Per-stage timings vs pycocotools mAP, together
 

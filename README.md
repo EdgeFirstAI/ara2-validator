@@ -1,28 +1,42 @@
 # HAL Validator (`ara2-validator`)
 
-A rudimentary harness for Ultralytics YOLO segmentation validation. It runs **reference pipelines** (vendor- or upstream-faithful, no EdgeFirst components) and **EdgeFirst HAL-optimized pipelines** on the same model and the same hardware, pairing per-stage timings with pycocotools mAP so the cost in milliseconds and the benefit in accuracy points are readable off the same table.
+A rudimentary harness for Ultralytics YOLO segmentation validation. It compares **NPU reference pipelines** (vendor- or upstream-faithful, no EdgeFirst components) against **EdgeFirst HAL pipelines** on the same NPU model file, with both anchored against the **reference model** — the Ultralytics FP32 ONNX export — so accuracy drift and per-stage timing cost are readable off the same table.
 
 The repo started as `ara2-validator` (NXP Ara240 only) and now covers Ara240 and Hailo-8/8L on Raspberry Pi 5, with more targets planned. Each new target adds rows to the tables below and a subsection in [Reproduction](#reproduction) — no new per-platform sections in the body.
 
-## Reference vs EdgeFirst
+## Three concepts: reference model, reference pipeline, EdgeFirst pipeline
 
-A **reference** pipeline is what a user lands on following the upstream Ultralytics + vendor SDK documentation verbatim, with no EdgeFirst components in the path. An **EdgeFirst** pipeline swaps in `edgefirst-hal` for preprocess, decode, and mask materialisation while keeping the same NPU and the same model file.
+The terminology is consistent across all EdgeFirst documentation, and matters here because each table compares all three:
 
-| Backend | Category | Description | Platforms |
+- **Reference model** — Ultralytics ONNX FP32 export, treated as effectively lossless from the original PyTorch checkpoint. This is the accuracy ceiling, run once on a host CPU; its absolute mAP is the baseline that every NPU number is reported relative to. Per-stage timing is not reported (host CPU latency is not the question this validator is asking).
+- **Reference pipeline** — the NPU run via the vendor's documented integration: NPU + vendor SDK (e.g. TAPPAS C++ for Hailo, dvapi for Ara240) + OpenCV/NumPy for whatever the SDK doesn't cover (preprocess everywhere; postprocess on Ara240, where the SDK ships no postprocess library). This is what a user lands on following the SDK docs verbatim.
+- **EdgeFirst pipeline** — the *same NPU model* run through `edgefirst-hal` for preprocessing, detection decode, NMS, and mask materialisation. Same NPU bytes, same compiled graph, same int8 quantisation — only the host-side software around the NPU changes.
+
+The "drift vs reference model" column in each table is what the int8 quantisation **plus** the chosen pipeline cost in mAP versus the FP32 ceiling. Comparing the reference-pipeline drift with the edgefirst-pipeline drift on the same NPU is the within-target apples-to-apples accuracy answer.
+
+### Backend dispatch
+
+| Backend | Concept | Description | Platforms |
 |---|---|---|---|
-| `onnx_reference` | reference | Ultralytics FP32 host baseline — accuracy ceiling | any CPU/CUDA host |
-| `reference` (`--backend numpy`) | reference | NXP `dvapi.py` ctypes + OpenCV/NumPy postprocess | imx8mp-frdm, imx95-frdm |
-| `hailo` (`--backend hailo`) | reference | Hailo TAPPAS non-GStreamer C++ postprocess | RPi5 + Hailo-8/8L |
-| `edgefirst` (`--backend hal`) | EdgeFirst | HAL on Ara240 — DMA-BUF zero-copy GPU↔NPU | imx8mp-frdm, imx95-frdm |
-| `hal-hailo` (`--backend hal-hailo`) | EdgeFirst | HAL on Hailo — GPU letterbox + HAL Decoder | RPi5 + Hailo-8/8L |
+| `onnx_reference` | reference model | Ultralytics FP32 ONNX export, host CPU/CUDA — accuracy ceiling | any host |
+| `reference` (`--backend numpy`) | reference pipeline | NXP `dvapi.py` ctypes + OpenCV/NumPy postprocess | imx8mp-frdm, imx95-frdm |
+| `hailo` (`--backend hailo`) | reference pipeline | Hailo TAPPAS non-GStreamer C++ postprocess | RPi5 + Hailo-8/8L |
+| `edgefirst` (`--backend hal`) | EdgeFirst pipeline | HAL on Ara240 — DMA-BUF zero-copy GPU↔NPU | imx8mp-frdm, imx95-frdm |
+| `hal-hailo` (`--backend hal-hailo`) | EdgeFirst pipeline | HAL on Hailo — GPU letterbox + HAL Decoder | RPi5 + Hailo-8/8L |
 
-### Per-platform reference notes
+### Per-platform reference-pipeline notes
 
-**Ara240 (`numpy` backend).** The reference uses NXP's `dvapi.py` ctypes wrapper around `libaraclient_aarch64.so` for NPU inference, followed by `cv2.dnn.NMSBoxes` for NMS and `cv2.resize` per-detection for mask decode. This is the path documented by NXP as the vendor integration route.
+**Ara240 (`numpy` backend).** Uses NXP's `dvapi.py` ctypes wrapper around `libaraclient_aarch64.so` for NPU inference, followed by `cv2.dnn.NMSBoxes` for NMS and `cv2.resize` per-detection for mask decode. This is the path documented by NXP as the vendor integration route.
 
-**Hailo (`hailo` backend).** The reference uses Hailo's official non-GStreamer C++ instance-segmentation example — the same postprocess that TAPPAS GStreamer apps ship as a shared library. It is vendored under `third_party/hailo_tappas_baseline/` at commit [`7b850e0`](https://github.com/hailo-ai/Hailo-Application-Code-Examples/tree/7b850e0444a142ada88443d675e3c3ddda18bd74) of [hailo-ai/Hailo-Application-Code-Examples](https://github.com/hailo-ai/Hailo-Application-Code-Examples) (MIT licence). A small local patch threads runtime score/IoU thresholds through the `filter()` call so pycocotools' `0.001` convention works; the original logic is otherwise untouched. See [`third_party/hailo_tappas_baseline/README.md`](third_party/hailo_tappas_baseline/README.md) for provenance, the patch description, and the upstream commit hash.
+**Hailo (`hailo` backend).** Uses Hailo's official non-GStreamer C++ instance-segmentation example — the same postprocess that TAPPAS GStreamer apps ship as a shared library. It is vendored under `third_party/hailo_tappas_baseline/` at commit [`7b850e0`](https://github.com/hailo-ai/Hailo-Application-Code-Examples/tree/7b850e0444a142ada88443d675e3c3ddda18bd74) of [hailo-ai/Hailo-Application-Code-Examples](https://github.com/hailo-ai/Hailo-Application-Code-Examples) (MIT licence). A small local patch threads runtime score/IoU thresholds through the `filter()` call so pycocotools' `0.001` convention works; the original logic is otherwise untouched. See [`third_party/hailo_tappas_baseline/README.md`](third_party/hailo_tappas_baseline/README.md) for provenance, the patch description, and the upstream commit hash.
 
 **Future platforms** add a bullet here, rows in the tables below, and a subsection in [Reproduction](#reproduction).
+
+### A note on HAL preprocess: GPU vs CPU
+
+HAL's preprocess runs on the platform GPU (V3D on RPi5, Vivante on Ara240 boards) via OpenGL ES, not on the CPU. At a 640×640 model input and an aarch64 Cortex-A76, OpenCV's NEON-accelerated `cv2.resize` on the CPU is fast enough that HAL GPU preprocess does **not** beat it on wall-clock — measured on RPi5, OpenCV is ~0.9 ms vs HAL's ~2.2 ms (the extra 1.3 ms is one host memcpy out of the GPU buffer that a unified-memory NPU like Ara240 doesn't pay). What HAL preprocess gives back is that the CPU isn't doing the work, so the host-side decode + NMS + mask matmul that follow can run on a quiet CPU instead of fighting the resize for cycles. At larger camera resolutions (1080p input → 640×640 model) HAL's GPU preprocess is several times faster than OpenCV CPU even on wall-clock; below 640×640 the trade is GPU-utilisation vs CPU-availability, not raw latency.
+
+The reference-pipeline rows below all use OpenCV CPU preprocess because that is what the vendor SDKs document. EdgeFirst pipelines all use HAL GPU preprocess. A user who wants HAL postprocess with OpenCV preprocess (or any other combination) can wire it up from the building blocks in `ara2_validator/preprocess.py` and `ara2_validator/postprocess_hal.py`; the validator does not enumerate every permutation.
 
 ### Output tensor structure: 4 tensors (Ara240) vs 10 tensors (Hailo)
 
@@ -39,63 +53,66 @@ The two NPUs leave different amounts of work for the host, which frames the post
 
 Ara240 runs box-DFL decode on-chip; Hailo leaves it as host work in exchange for a smaller compiled graph. HAL's per-scale Decoder absorbs the extra DFL work, which is why the `nms_decode` column for `hal-hailo` carries more CPU time than for `hal` on Ara240 — it is doing more. Schema-driven decoding is mandatory on Hailo: the embedded `edgefirst.json` (schema-v2, written by hailo-converter v0.3.0+) tells HAL which of the 10 raw tensors holds which role and which FPN scale.
 
-The Ara240 and Hailo numbers are **not directly comparable across NPUs.** The HEF and DVM come from different training checkpoints (`yolov8n-seg-latest-t-264d` for Hailo, `yolov8n-seg-kinara-1.2.1` for Ara240) with different int8 calibration. The valid comparisons are *within* a target: TAPPAS vs HAL+Hailo on the same HEF, and `dvapi` vs HAL on the same DVM.
-
 ## Results
 
 ### A — coco-val5k (5000 images, `--score-threshold 0.001`)
 
-Full COCO val2017. End-to-end = preprocess + inference + decode + mask materialisation (image decode and RLE encoding excluded). Drift = HAL minus reference in absolute percentage points.
+Full COCO val2017. The reference-model row at the top is the FP32 ceiling; every NPU row reports its absolute mAP and the drift vs that ceiling in percentage points. End-to-end = preprocess + inference + decode + mask materialisation (image decode and RLE encoding excluded).
 
-| Platform | Backend | Category | Box mAP | Box mAP@50 | Mask mAP | Mask mAP@50 | Mask mAR@100 | End-to-end | FPS |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| host CPU | `onnx_reference` (FP32) | reference | **0.3605** | 0.5119 | **0.2801** | 0.4716 | 0.4115 | — | — |
-| imx8mp-frdm | `edgefirst` HAL (int8) | EdgeFirst | 0.3068 | 0.4745 | 0.2756 | 0.4549 | 0.4170 | — | — |
-| imx8mp-frdm drift | | | **−5.37 pp** | −3.74 pp | **−0.45 pp** | −1.67 pp | +0.55 pp | | |
-| RPi5 + Hailo-8L | `hailo` TAPPAS reference | reference | 0.2164 | 0.3419 | 0.1704 | 0.3046 | 0.3575 | 1218.32 ms | 0.8 |
-| RPi5 + Hailo-8L | `hal-hailo` HAL | EdgeFirst | **0.3306** | **0.4744** | **0.2768** | **0.4461** | **0.3794** | **29.65 ms** | **33.7** |
-| RPi5 + Hailo-8L drift | | | **+11.42 pp** | +13.25 pp | **+10.64 pp** | +14.15 pp | +2.19 pp | — | **41×** |
+| Platform | Pipeline | Box mAP (Δ pp) | Box mAP@50 | Mask mAP (Δ pp) | Mask mAP@50 | Mask mAR@100 | End-to-end | FPS |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| host CPU | reference model (ONNX FP32) | **0.3605** | 0.5119 | **0.2801** | 0.4716 | 0.4115 | — | — |
+| imx8mp-frdm | reference pipeline (dvapi+opencv) | — see note | — | — | — | — | — | — |
+| imx8mp-frdm | EdgeFirst pipeline (HAL) | 0.3068 (−5.37) | 0.4745 | 0.2756 (−0.45) | 0.4549 | 0.4170 | — | — |
+| RPi5 + Hailo-8L | reference pipeline (TAPPAS) | 0.2164 (−14.41) | 0.3419 | 0.1704 (−10.97) | 0.3046 | 0.3575 | 1218.32 ms | 0.8 |
+| RPi5 + Hailo-8L | EdgeFirst pipeline (HAL) | **0.3306 (−2.99)** | **0.4744** | **0.2768 (−0.33)** | **0.4461** | **0.3794** | **29.65 ms** | **33.7** |
 
 > [!NOTE]
-> The `dvapi` reference (Ara240) is absent from val5k because `libaraclient_aarch64.so` hits a glibc `double free or corruption` abort after ~100–200 sequential inferences. coco128 (128 images) generally completes; val5k (5000) does not. The `edgefirst` HAL path via the Rust-backed `edgefirst-ara2` wrapper is unaffected.
+> **Ara240 reference pipeline on val5k is N/A** because `libaraclient_aarch64.so` hits a glibc `double free or corruption` abort after ~100–200 sequential inferences; coco128 (128 images) generally completes, val5k (5000) does not. The EdgeFirst pipeline goes through the Rust-backed `edgefirst-ara2` wrapper and is unaffected.
+
+> [!IMPORTANT]
+> On Hailo, the EdgeFirst pipeline lands within **~3 pp Box** and **~0.3 pp Mask** of the FP32 reference model and runs at **~33.7 FPS**. The TAPPAS reference pipeline drifts ~14 pp Box and ~11 pp Mask from the same ceiling and runs at 0.8 FPS — the int8 quantisation costs almost nothing, the host-side pipeline choice costs ten percentage points and 41× throughput.
 
 ### B — coco128 @ validation threshold (`--score-threshold 0.001`)
 
-128 images, score threshold 0.001 (Ultralytics `val` default — required for correct mAP). Mask column shows the HAL mask materialisation mode; `—` indicates a fused postprocess that does not split decode from mask. All runs synchronous, one frame at a time.
+128 images, score threshold 0.001 (Ultralytics `val` default — required for full P-R curve mAP). All runs synchronous, one frame at a time.
 
-| Platform | Backend | Category | Mask | Box mAP | Box mAP@50 | Mask mAP | Mask mAP@50 | Pre | Inf | Decode | Mask | End-to-end |
-|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| host CPU | `onnx_reference` (FP32) | reference | retina | **0.4533** | — | **0.3444** | — | 1.7 ms | 46.3 ms | — | 47.6 ms | 95.7 ms |
-| host CPU | `onnx_reference` (FP32) | reference | fast | 0.4533 | — | 0.3337 | — | 1.8 ms | 44.6 ms | — | 47.8 ms | 94.1 ms |
-| imx8mp-frdm | `reference` dvapi+opencv | reference | retina | 0.3941 | — | 0.3278 | — | 24 ms | 18 ms | 32 ms | 265 ms | 339 ms |
-| imx8mp-frdm | `reference` dvapi+opencv | reference | fast | 0.3941 | — | 0.3221 | — | 21 ms | 18 ms | 33 ms | 179 ms | 251 ms |
-| imx8mp-frdm | `edgefirst` HAL | EdgeFirst | retina | 0.3955 | — | 0.3218 | — | 6.2 ms | 13.5 ms | 2.6 ms | 9.7 ms | **32.0 ms** |
-| imx8mp-frdm | `edgefirst` HAL | EdgeFirst | fast | 0.3955 | — | 0.3095 | — | 6.2 ms | 13.5 ms | 2.6 ms | 3.8 ms | **26.1 ms** |
-| imx95-frdm | `reference` dvapi+opencv | reference | retina | 0.3941 | — | 0.3278 | — | 20 ms | 16 ms | 32 ms | 172 ms | 240 ms |
-| imx95-frdm | `reference` dvapi+opencv | reference | fast | 0.3941 | — | 0.3221 | — | 17 ms | 16 ms | 31 ms | 193 ms | 257 ms |
-| imx95-frdm | `edgefirst` HAL | EdgeFirst | retina | 0.3966 | — | 0.3231 | — | 4.1 ms | 11.3 ms | 2.6 ms | 7.6 ms | **25.5 ms** |
-| imx95-frdm | `edgefirst` HAL | EdgeFirst | fast | 0.3966 | — | 0.3103 | — | 4.1 ms | 11.3 ms | 2.5 ms | 2.9 ms | **20.8 ms** |
-| RPi5 + Hailo-8L | `hailo` TAPPAS reference | reference | fused | 0.2764 | 0.4202 | 0.2026 | 0.3587 | 0.88 ms | 15.78 ms | — fused 1039.36 ms — | | **1056.04 ms** |
-| RPi5 + Hailo-8L | `hal-hailo` HAL | EdgeFirst | retina | **0.3965** | **0.5442** | **0.3187** | **0.4934** | 2.25 ms | 16.42 ms | 9.03 ms | 1.70 ms | **29.41 ms** |
+| Platform | Pipeline | Mask mode | Box mAP (Δ pp) | Mask mAP (Δ pp) | Pre | Inf | Decode | Mask | End-to-end |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| host CPU | reference model (ONNX FP32) | retina | **0.4533** | **0.3444** | — | — | — | — | — |
+| host CPU | reference model (ONNX FP32) | fast | 0.4533 | 0.3337 | — | — | — | — | — |
+| imx8mp-frdm | reference pipeline (dvapi+opencv) | retina | 0.3941 (−5.92) | 0.3278 (−1.66) | 24 ms | 18 ms | 32 ms | 265 ms | 339 ms |
+| imx8mp-frdm | reference pipeline (dvapi+opencv) | fast | 0.3941 (−5.92) | 0.3221 (−1.16) | 21 ms | 18 ms | 33 ms | 179 ms | 251 ms |
+| imx8mp-frdm | EdgeFirst pipeline (HAL) | retina | 0.3955 (−5.78) | 0.3218 (−2.26) | 6.2 ms | 13.5 ms | 2.6 ms | 9.7 ms | **32.0 ms** |
+| imx8mp-frdm | EdgeFirst pipeline (HAL) | fast | 0.3955 (−5.78) | 0.3095 (−2.42) | 6.2 ms | 13.5 ms | 2.6 ms | 3.8 ms | **26.1 ms** |
+| imx95-frdm | reference pipeline (dvapi+opencv) | retina | 0.3941 (−5.92) | 0.3278 (−1.66) | 20 ms | 16 ms | 32 ms | 172 ms | 240 ms |
+| imx95-frdm | reference pipeline (dvapi+opencv) | fast | 0.3941 (−5.92) | 0.3221 (−1.16) | 17 ms | 16 ms | 31 ms | 193 ms | 257 ms |
+| imx95-frdm | EdgeFirst pipeline (HAL) | retina | 0.3966 (−5.67) | 0.3231 (−2.13) | 4.1 ms | 11.3 ms | 2.6 ms | 7.6 ms | **25.5 ms** |
+| imx95-frdm | EdgeFirst pipeline (HAL) | fast | 0.3966 (−5.67) | 0.3103 (−2.34) | 4.1 ms | 11.3 ms | 2.5 ms | 2.9 ms | **20.8 ms** |
+| RPi5 + Hailo-8L | reference pipeline (TAPPAS) | fused | 0.2764 (−17.69) | 0.2026 (−14.18) | 0.88 ms | 15.78 ms | — fused 1039.36 ms — | | **1056.04 ms** |
+| RPi5 + Hailo-8L | EdgeFirst pipeline (HAL) | retina | **0.3965 (−5.68)** | **0.3187 (−2.57)** | 2.25 ms | 16.42 ms | 9.03 ms | 1.70 ms | **29.41 ms** |
 
 > [!IMPORTANT]
 > Every row above is a **synchronous, single-frame-in-flight** measurement — no double-buffering, no async dispatch, no concurrent stages. See [Why per-stage, why serial](#why-per-stage-why-serial).
 
+> [!NOTE]
+> Drift values for the Hailo rows are computed against the same ONNX FP32 reference model row even though the on-target HEF and the Ara240 DVM come from different training checkpoints (`yolov8n-seg-latest-t-264d` for Hailo, `yolov8n-seg-kinara-1.2.1` for Ara240). The cross-NPU drift comparison is therefore approximate at the ~1–2 pp level; the within-target reference-pipeline-vs-EdgeFirst-pipeline comparison is exact.
+
 ### C — coco128 @ deployment threshold (`--score-threshold 0.5`)
 
-Same dataset, score threshold 0.5 — representative of real-time inference where only high-confidence detections survive. mAP is ~30% lower than Table B because pycocotools can no longer integrate the full precision-recall curve; this is an evaluation artefact, not a model quality change. See [Why `0.001`?](#score-thresholds-validation-vs-deployment) for the full explanation.
+Same dataset, score threshold 0.5 — representative of real-time inference where only high-confidence detections survive. The reference model is not re-evaluated at this threshold (FP32 baselines are reported at the standard `val` 0.001), so this table shows per-pipeline absolute numbers without an FP32 anchor; mAP at `0.5` is also lower than at `0.001` because pycocotools can no longer integrate the full precision-recall curve (an evaluation artefact, not a model quality change — see [Score thresholds](#score-thresholds-validation-vs-deployment)).
 
-| Platform | Backend | Category | Mask | Box mAP | Box mAP@50 | Mask mAP | Mask mAP@50 | Pre | Inf | Decode | Mask | End-to-end |
-|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| imx8mp-frdm | `edgefirst` HAL | EdgeFirst | retina | 0.2778 | — | 0.2434 | — | 6.1 ms | 13.4 ms | 2.2 ms | 3.5 ms | **25.2 ms** |
-| imx8mp-frdm | `edgefirst` HAL | EdgeFirst | fast | 0.2778 | — | 0.2364 | — | 6.2 ms | 13.4 ms | 2.3 ms | 1.8 ms | **23.6 ms** |
-| imx95-frdm | `edgefirst` HAL | EdgeFirst | retina | 0.2793 | — | 0.2475 | — | 3.9 ms | 11.3 ms | 2.1 ms | 3.3 ms | **20.5 ms** |
-| imx95-frdm | `edgefirst` HAL | EdgeFirst | fast | 0.2793 | — | 0.2395 | — | 3.9 ms | 11.3 ms | 2.2 ms | 1.5 ms | **18.9 ms** |
-| RPi5 + Hailo-8L | `hailo` TAPPAS reference | reference | fused | **0.2855** | **0.3461** | 0.1784 | 0.3130 | 0.92 ms | 15.68 ms | — fused 48.80 ms — | | **65.41 ms** |
-| RPi5 + Hailo-8L | `hal-hailo` HAL | EdgeFirst | retina | 0.2474 | 0.3076 | **0.2160** | **0.2997** | 2.22 ms | 16.42 ms | 8.93 ms | 0.62 ms | **28.21 ms** |
+| Platform | Pipeline | Mask mode | Box mAP | Box mAP@50 | Mask mAP | Mask mAP@50 | Pre | Inf | Decode | Mask | End-to-end |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| imx8mp-frdm | EdgeFirst pipeline (HAL) | retina | 0.2778 | — | 0.2434 | — | 6.1 ms | 13.4 ms | 2.2 ms | 3.5 ms | **25.2 ms** |
+| imx8mp-frdm | EdgeFirst pipeline (HAL) | fast | 0.2778 | — | 0.2364 | — | 6.2 ms | 13.4 ms | 2.3 ms | 1.8 ms | **23.6 ms** |
+| imx95-frdm | EdgeFirst pipeline (HAL) | retina | 0.2793 | — | 0.2475 | — | 3.9 ms | 11.3 ms | 2.1 ms | 3.3 ms | **20.5 ms** |
+| imx95-frdm | EdgeFirst pipeline (HAL) | fast | 0.2793 | — | 0.2395 | — | 3.9 ms | 11.3 ms | 2.2 ms | 1.5 ms | **18.9 ms** |
+| RPi5 + Hailo-8L | reference pipeline (TAPPAS) | fused | **0.2855** | **0.3461** | 0.1784 | 0.3130 | 0.92 ms | 15.68 ms | — fused 48.80 ms — | | **65.41 ms** |
+| RPi5 + Hailo-8L | EdgeFirst pipeline (HAL) | retina | 0.2474 | 0.3076 | **0.2160** | **0.2997** | 2.22 ms | 16.42 ms | 8.93 ms | 0.62 ms | **28.21 ms** |
 
 > [!NOTE]
-> At the deployment threshold, TAPPAS Box mAP (0.286) exceeds HAL (0.247). This is not an accuracy regression — at the validation threshold (the correct measurement) HAL wins by +12 pp. At 0.5, HAL's per-scale Decoder filters more aggressively at the score check, dropping medium-confidence detections; with the truncated P-R curve, retaining those detections looks like accuracy. The full-curve numbers at 0.001 are the unambiguous ranking.
+> At the deployment threshold, TAPPAS Box mAP (0.286) edges HAL (0.247). This is not an accuracy regression — at the validation threshold (the correct measurement) HAL wins by +12 pp. At `0.5`, HAL's per-scale Decoder filters more aggressively at the score check, dropping medium-confidence detections; with the truncated P-R curve, retaining those detections looks like accuracy. Mask mAP, less sensitive to the truncation, still ranks HAL higher (0.216 vs 0.178). The full-curve numbers at `0.001` in Table B are the unambiguous accuracy ranking.
 
 ### What "end-to-end" measures
 
@@ -265,7 +282,7 @@ The `edgefirst` path differs from the `reference` path in three places:
 
 | | `onnx_reference` | `reference` (`numpy`) | `edgefirst` (`hal`) | `hailo` | `hal-hailo` |
 |---|---|---|---|---|---|
-| Category | reference | reference | EdgeFirst | reference | EdgeFirst |
+| Concept | reference model | reference pipeline | EdgeFirst pipeline | reference pipeline | EdgeFirst pipeline |
 | Device | any CPU/CUDA | imx8mp-frdm, imx95-frdm | imx8mp-frdm, imx95-frdm | RPi5 + Hailo-8/8L | RPi5 + Hailo-8/8L |
 | Runtime | ONNX Runtime | dvapi → libaraclient | edgefirst-ara2 → libaraclient | HailoRT | HailoRT |
 | Preprocess | cv2 (CPU) | cv2 + int8 quant (CPU) | HAL GPU (DMA-BUF) | cv2 (CPU) | HAL GPU + memcpy |
