@@ -52,6 +52,13 @@ class ModelSpec:
     # For split-decoder: merged boxes quantization
     merged_box_qn: Optional[float] = None
     merged_box_offset: Optional[int] = None
+    # Raw embedded edgefirst.json from the dvm trailer, when present.
+    # HalPipeline uses it (when non-None) to construct the HAL Decoder
+    # via :meth:`hal.Decoder.new_from_json_str` — the schema-driven path
+    # that engages the per-scale subsystem when the schema declares
+    # nested per-FPN-level outputs. When absent, HalPipeline falls back
+    # to shape-based :meth:`new_from_outputs` construction.
+    embedded_json: Optional[dict] = None
 
 
 # ── Metadata extraction ──────────────────────────────────────────────────────
@@ -243,6 +250,7 @@ def load_model(
         outputs=outputs,
         merged_box_qn=merged_qn,
         merged_box_offset=merged_off,
+        embedded_json=meta,
     )
 
     return model, model_spec

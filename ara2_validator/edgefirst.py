@@ -261,8 +261,15 @@ def main() -> int:
         )
 
         # Build COCO results entries (un-letterboxes boxes, attaches RLEs).
+        # ``decoder.normalized_boxes`` reflects the construction path:
+        # legacy ``new_from_outputs`` normalises via the box-quant trick
+        # (returns [0,1]); the schema-driven per-scale path keeps boxes
+        # in pixel space (HAL forces ``normalized=False``). Pass the
+        # flag through so :func:`unletterbox_box_array` picks the right
+        # inverse transform.
         boxes_orig = unletterbox_box_array(
             result.boxes, result.lb_info, pipeline.input_w, pipeline.input_h,
+            normalized=pipeline.decoder.normalized_boxes,
         )
         scores_np = np.asarray(result.scores, dtype=np.float32)
         classes_np = np.asarray(result.classes, dtype=np.uint64)

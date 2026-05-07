@@ -39,6 +39,7 @@ Each of these is also commented inline below.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 try:
@@ -195,22 +196,38 @@ class HalPipeline:
     # ------------------------------------------------------------------
 
     def _build_decoder(self):
-        """Construct the typed Output descriptors and the HAL Decoder.
+        """Construct the HAL Decoder.
 
-        The DVM model exposes per-output ``shape``, ``qn``, and
-        ``offset`` metadata. We classify each output by its shape into
-        one of four roles (protos, boxes, mask_coefficients, scores)
-        and emit a typed :class:`hal.Output` descriptor for it.
+        Two paths, selected by *probing for embedded edgefirst.json* in
+        the dvm:
 
-        The "box quant trick" — dividing the boxes' raw quant scale by
-        ``input_dim`` — is the only non-obvious step here. Models in
-        this family emit boxes in *pixel* coordinates (xyxy ∈ [0, 640]
-        for a 640×640 model). Pre-scaling the dequant slope by
-        ``1 / input_dim`` makes HAL produce ``[0, 1]`` normalised
+        * **Schema-driven** (embedded JSON present) — passes the schema
+          verbatim to :meth:`hal.Decoder.new_from_json_str`. HAL routes
+          schema-v2 declarations with nested per-FPN-level outputs
+          through its per-scale subsystem; monolithic schemas through
+          the legacy decoder. This is the canonical construction path.
+
+        * **Shape-driven fallback** (no embedded JSON) — emits one typed
+          :class:`hal.Output` descriptor per physical output by
+          shape-classification and constructs the decoder via
+          :meth:`hal.Decoder.new_from_outputs`. Preserved for older
+          dvms that ship without embedded metadata.
+
+        For the shape-driven path, the "box quant trick" — dividing the
+        boxes' raw quant scale by ``input_dim`` — is the only non-obvious
+        step. Models in this family emit boxes in *pixel* coordinates
+        (xyxy ∈ [0, 640] for a 640×640 model). Pre-scaling the dequant
+        slope by ``1 / input_dim`` makes HAL produce ``[0, 1]`` normalised
         coordinates directly, saving a per-frame division. The caller
         un-letterboxes afterwards via ``(p * input_dim - pad) / scale``
-        (see :func:`unletterbox_box_array`).
+        (see :func:`unletterbox_box_array`). The schema-driven path
+        keeps boxes in pixel space and HAL's per-scale builder forces
+        ``normalized_boxes=False``; the caller un-letterboxes from
+        pixel space accordingly.
         """
+        if self.spec.embedded_json is not None:
+            return self._build_decoder_from_schema()
+
         shapes, quants_list = [], []
         for i in range(self.model.n_outputs):
             shape = list(self.model.output_shape(i))
@@ -291,8 +308,67 @@ class HalPipeline:
         )
         return shapes, decoder
 
+    def _build_decoder_from_schema(self):
+        """Schema-driven Decoder construction.
+
+        Passes the dvm's embedded edgefirst.json verbatim to
+        :meth:`hal.Decoder.new_from_json_str`. HAL inspects the schema
+        and routes to the per-scale subsystem when nested per-FPN-level
+        outputs are declared, otherwise to the legacy decoder.
+
+        The shapes returned mirror the runtime tensor layout (each
+        physical output's shape with a leading batch axis), used by
+        :meth:`_wrap_output_tensors` to build :class:`hal.Tensor`
+        instances over the NPU's output DMA-BUFs.
+        """
+        shapes = []
+        for i in range(self.model.n_outputs):
+            shape = list(self.model.output_shape(i))
+            while len(shape) > 1 and shape[-1] == 1:
+                shape.pop()
+            shape.insert(0, 1)
+            shapes.append(shape)
+
+        decoder = hal.Decoder.new_from_json_str(
+            json.dumps(self.spec.embedded_json),
+            score_threshold=self.score_threshold,
+            iou_threshold=self.iou_threshold,
+            nms=hal.Nms.ClassAware,
+        )
+        return shapes, decoder
+
     def _wrap_output_tensors(self):
-        """Wrap each output DMA-BUF fd as a HAL Tensor (one-shot)."""
+        """Wrap each output DMA-BUF fd as a HAL Tensor (one-shot).
+
+        Per-tensor quantization metadata is attached when the
+        schema-driven decoder path is active. HAL's per-scale subsystem
+        reads ``tensor.quantization()`` live to dequantize each level
+        and *requires* per-tensor metadata to be present.
+
+        **Quant source:** the runtime ``model.output_quants(i)`` exposes
+        a hardware-level fixed-point representation that doesn't agree
+        with the float-domain quantization scale the dequant kernels
+        expect. The embedded edgefirst.json carries the float-domain
+        scale (per :ref:`schema-v2 quantization <schema-v2>`); we look
+        up each runtime tensor's matching schema entry by layer name
+        and attach that scale instead.
+
+        For the shape-driven (legacy ``new_from_outputs``) path, quant
+        lives on the :class:`hal.Output` descriptors built in
+        :meth:`_build_decoder`; nothing is attached to the tensor here.
+        """
+        # Build a layer_name → schema quantization lookup when embedded
+        # JSON is available. Walks both nested children (per-scale) and
+        # bare top-level outputs (monolithic).
+        schema_quants: dict = {}
+        if self.spec.embedded_json is not None:
+            for top in self.spec.embedded_json.get("outputs", []) or []:
+                for ch in top.get("outputs", []) or []:
+                    if ch.get("name"):
+                        schema_quants[ch["name"]] = ch.get("quantization")
+                if not top.get("outputs") and top.get("name"):
+                    schema_quants[top["name"]] = top.get("quantization")
+
         output_tensors = []
         for i in range(self.model.n_outputs):
             fd = self.model.output_tensor_fd(i)
@@ -312,6 +388,11 @@ class HalPipeline:
             # os.close(fd) after this. The HAL Tensor's drop releases
             # the GPU mapping and the fd together.
             t = hal.Tensor.from_fd(fd, self._shapes[i], dtype_str)
+            sq = schema_quants.get(oi.layer_name)
+            if sq is not None:
+                t.set_quantization_per_tensor(
+                    float(sq["scale"]), int(sq.get("zero_point", 0))
+                )
             output_tensors.append(t)
         return output_tensors
 
@@ -394,25 +475,40 @@ def unletterbox_box_array(
     lb_info: LetterboxInfo,
     input_w: int,
     input_h: int,
+    *,
+    normalized: bool = True,
 ):
-    """Map normalised letterboxed-space xyxy boxes to original-image pixel coords.
+    """Map letterboxed-space xyxy boxes to original-image pixel coords.
 
-    HAL's :class:`Decoder.decode_proto` returns boxes in normalised
-    ``[0, 1]`` xyxy coordinates inside the **letterboxed** model-input
-    space (consequence of the box-quant trick described in
-    :meth:`HalPipeline._build_decoder`). To produce coordinates in the
-    original-image pixel space (what COCO RLE encoding expects), we
-    invert the letterbox transform: ``(p * input_dim - pad) / scale``,
-    then clip to image bounds.
+    Two input coordinate conventions are supported, selected by
+    ``normalized``:
+
+    * ``normalized=True`` (default; legacy ``new_from_outputs`` path) —
+      HAL's :class:`Decoder.decode_proto` returns boxes in normalised
+      ``[0, 1]`` xyxy coordinates inside the **letterboxed** model-input
+      space (consequence of the box-quant trick described in
+      :meth:`HalPipeline._build_decoder`). The inverse letterbox is
+      ``(p * input_dim - pad) / scale``.
+
+    * ``normalized=False`` (schema-driven per-scale path) — HAL's
+      per-scale subsystem returns boxes in **pixel coords** within the
+      letterbox space. The inverse letterbox is ``(p - pad) / scale``;
+      no multiplication by ``input_dim`` is needed.
+
+    Pass ``pipeline.decoder.normalized_boxes`` here so the call site
+    doesn't have to know which Decoder construction path was taken.
 
     Parameters
     ----------
     boxes : array-like
-        ``(N, 4)`` xyxy in normalised letterboxed space (HAL output).
+        ``(N, 4)`` xyxy in letterboxed space (normalised or pixel).
     lb_info : LetterboxInfo
         Letterbox descriptor produced by the preprocess step.
     input_w, input_h : int
         Model input dimensions (typically 640, 640).
+    normalized : bool, default ``True``
+        ``True`` if ``boxes`` are normalised [0, 1] (legacy path);
+        ``False`` if ``boxes`` are in pixel space (per-scale path).
 
     Returns
     -------
@@ -424,8 +520,12 @@ def unletterbox_box_array(
     bx = np.asarray(boxes, dtype=np.float32).copy()
     if len(bx) == 0:
         return bx
-    bx[:, [0, 2]] = (bx[:, [0, 2]] * input_w - lb_info.pad_x) / lb_info.scale
-    bx[:, [1, 3]] = (bx[:, [1, 3]] * input_h - lb_info.pad_y) / lb_info.scale
+    if normalized:
+        bx[:, [0, 2]] = (bx[:, [0, 2]] * input_w - lb_info.pad_x) / lb_info.scale
+        bx[:, [1, 3]] = (bx[:, [1, 3]] * input_h - lb_info.pad_y) / lb_info.scale
+    else:
+        bx[:, [0, 2]] = (bx[:, [0, 2]] - lb_info.pad_x) / lb_info.scale
+        bx[:, [1, 3]] = (bx[:, [1, 3]] - lb_info.pad_y) / lb_info.scale
     bx[:, [0, 2]] = np.clip(bx[:, [0, 2]], 0, lb_info.orig_w)
     bx[:, [1, 3]] = np.clip(bx[:, [1, 3]], 0, lb_info.orig_h)
     return bx
