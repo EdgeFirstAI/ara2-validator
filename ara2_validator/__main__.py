@@ -58,9 +58,13 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Output COCO results JSON path")
     parser.add_argument("--labels", default=None,
                         help="Path to labels.txt (fallback if not in DVM)")
-    parser.add_argument("--backend", choices=["numpy", "hal"], default="hal",
+    parser.add_argument("--backend", choices=["numpy", "hal", "hailo"],
+                        default="hal",
                         help="Preprocessing + postprocessing backend "
-                             "(default: hal)")
+                             "(default: hal). 'hailo' expects --model to "
+                             "point at a .hef file and uses the vendored "
+                             "TAPPAS reference postprocess for head-to-head "
+                             "comparison against HAL.")
     parser.add_argument("--score-threshold", type=float, default=0.001,
                         help="NMS score threshold (default 0.001 — "
                              "Ultralytics val convention)")
@@ -344,6 +348,90 @@ def _run_numpy(args, image_paths: list[str], spec, model) -> list[dict]:
     return all_results
 
 
+def _run_hailo(args, image_paths: list[str]) -> list[dict]:
+    """Hailo backend: vendored TAPPAS reference postprocess.
+
+    Drives a Hailo HEF directly via :class:`HailoTappasPipeline`, which
+    wraps the C++ shim in ``third_party/hailo_tappas_baseline``. Unlike
+    HAL or numpy, this path doesn't go through the Ara240 dvproxy stack
+    — it operates on a ``.hef`` file passed via ``--model``.
+    """
+    from .hailo_pipeline import (
+        HailoTappasPipeline,
+        boxes_normalized_to_pixels,
+        threshold_masks_to_uint8,
+    )
+
+    log.info("HEF:     %s", args.model)
+
+    pipeline = HailoTappasPipeline(
+        args.model,
+        score_threshold=args.score_threshold,
+        iou_threshold=args.iou_threshold,
+        max_detections=args.max_detections,
+    )
+    log.info(
+        "Model input: %d×%d×%d",
+        pipeline.input_h, pipeline.input_w, pipeline.backend.model_channels,
+    )
+    log.info(
+        "Outputs: %s",
+        ", ".join(pipeline.backend.output_names),
+    )
+
+    if args.warmup > 0:
+        log.info("Warmup: %d iterations...", args.warmup)
+        pipeline.warmup(image_paths, n=args.warmup)
+
+    timings: dict[str, list[float]] = {
+        "decode": [], "preprocess": [], "inference": [],
+        "postprocess": [], "total": [],
+    }
+    all_results: list[dict] = []
+
+    for idx, img_path in enumerate(image_paths):
+        t_total = time.perf_counter()
+
+        result = pipeline.infer_one(img_path)
+
+        for k in ("decode", "preprocess", "inference", "postprocess"):
+            timings[k].append(result.timings[k])
+
+        # Read original-image dims for normalized → pixel box conversion.
+        # cv2.imread is the same call the pipeline made internally; on a
+        # warm filesystem the second read is essentially free, but we
+        # could carry orig_w/orig_h through the pipeline if it shows up.
+        bgr = cv2.imread(img_path)
+        if bgr is None:
+            raise FileNotFoundError(f"Cannot read: {img_path}")
+        orig_h, orig_w = bgr.shape[:2]
+
+        boxes_px = boxes_normalized_to_pixels(result.boxes, orig_w, orig_h)
+        masks = (
+            None
+            if args.no_masks or len(result.masks_float) == 0
+            else threshold_masks_to_uint8(result.masks_float)
+        )
+        all_results.extend(
+            build_coco_results(
+                img_path, boxes_px, result.scores, result.classes, masks,
+            )
+        )
+
+        timings["total"].append((time.perf_counter() - t_total) * 1e3)
+
+        if (idx + 1) % 10 == 0 or idx == 0 or idx == len(image_paths) - 1:
+            avg = float(np.mean(timings["total"][-10:]))
+            log.info(
+                "  [%4d/%d] %20s  %3d dets  %6.1f ms/img",
+                idx + 1, len(image_paths), Path(img_path).name,
+                len(result.scores), avg,
+            )
+
+    _print_summary_hailo(timings)
+    return all_results
+
+
 def _print_summary_hal(timings: dict[str, list[float]]) -> None:
     print()
     hdr = summary_header()
@@ -372,6 +460,29 @@ def _print_summary_hal(timings: dict[str, list[float]]) -> None:
         print(fmt_row("output formatting", trimmed_stats(of_total)))
         print(fmt_row("paste", trimmed_stats(timings["paste"]), indent=1))
         print(fmt_row("rle encode", trimmed_stats(timings["rle"]), indent=1))
+    _print_total(timings, hdr_len=len(hdr))
+
+
+def _print_summary_hailo(timings: dict[str, list[float]]) -> None:
+    """Hailo backend timing summary.
+
+    No DMA breakdown: HailoRT does report HW-only latency separately,
+    but we deliberately measure full-frame host wall-clock to keep the
+    comparison against HAL apples-to-apples. The decode/preprocess/
+    inference/postprocess split mirrors HAL's structure so the rows
+    line up visually when running both backends back to back.
+    """
+    print()
+    hdr = summary_header()
+    print(hdr)
+    print("─" * len(hdr))
+    print(fmt_row("image decode", trimmed_stats(timings["decode"])))
+    print(fmt_row("preprocess (OpenCV)",
+                  trimmed_stats(timings["preprocess"])))
+    print(fmt_row("inference (wall)",
+                  trimmed_stats(timings["inference"])))
+    print(fmt_row("postprocess (TAPPAS)",
+                  trimmed_stats(timings["postprocess"])))
     _print_total(timings, hdr_len=len(hdr))
 
 
@@ -428,31 +539,37 @@ def main() -> int:
 
     image_paths = _collect_images(args.images, args.max_images)
 
-    from .model import load_model
-    model, spec = load_model(
-        args.model, labels_path=args.labels, socket_path=args.socket,
-    )
-
-    c, input_h, input_w = spec.input_shape
     log.info("Model:   %s", args.model)
     log.info("Images:  %d from %s", len(image_paths), args.images)
     log.info("Backend: %s", args.backend)
     log.info("Output:  %s", args.output)
-    log.info(
-        "Input:   %d×%d×%d, qn=%.6f, offset=%d, signed=%s",
-        c, input_h, input_w,
-        spec.input_qn, spec.input_offset, spec.input_signed,
-    )
-    log.info(
-        "Outputs: %s",
-        ", ".join(f"{k}={v.shape}" for k, v in spec.outputs.items()),
-    )
-    log.info("Labels:  %d classes", len(spec.labels))
 
-    if args.backend == "hal":
-        all_results = _run_hal(args, image_paths, spec, model)
+    if args.backend == "hailo":
+        # Hailo path drives a .hef directly via HailoRT — no dvproxy,
+        # no Ara240-specific tensor spec. The pipeline introspects the
+        # HEF for input dims and output names itself.
+        all_results = _run_hailo(args, image_paths)
     else:
-        all_results = _run_numpy(args, image_paths, spec, model)
+        from .model import load_model
+        model, spec = load_model(
+            args.model, labels_path=args.labels, socket_path=args.socket,
+        )
+        c, input_h, input_w = spec.input_shape
+        log.info(
+            "Input:   %d×%d×%d, qn=%.6f, offset=%d, signed=%s",
+            c, input_h, input_w,
+            spec.input_qn, spec.input_offset, spec.input_signed,
+        )
+        log.info(
+            "Outputs: %s",
+            ", ".join(f"{k}={v.shape}" for k, v in spec.outputs.items()),
+        )
+        log.info("Labels:  %d classes", len(spec.labels))
+
+        if args.backend == "hal":
+            all_results = _run_hal(args, image_paths, spec, model)
+        else:
+            all_results = _run_numpy(args, image_paths, spec, model)
 
     log.info("Total detections: %d", len(all_results))
     save_coco_results(all_results, args.output)
