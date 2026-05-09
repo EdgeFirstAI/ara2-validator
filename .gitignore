@@ -1,9 +1,11 @@
 __pycache__/
 *.onnx
 *.dvm
+*.hef
 *.egg-info/
 *.json
 *.log
 .pytest_cache/
 .venv/
 venv/
+results/

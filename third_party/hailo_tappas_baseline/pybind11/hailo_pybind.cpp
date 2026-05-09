@@ -90,63 +90,104 @@ size_t locate_hef_payload_size(const std::vector<uint8_t> &buf) {
     return buf.size();
 }
 
-// Aspect-preserving letterbox: scale to fit (longest side matches model dim),
-// pad bottom and right with zeros. Matches the upstream
-// `make_model_space_canvas` semantics (instance_seg_postprocess.cpp:120).
+// Shim-local letterbox descriptor. Replaces upstream's letterbox-map struct
+// (which only carries factor + crop_w/h + pad_w/h, sufficient for top-left
+// letterbox) so we can carry pad_left/pad_top for centered letterbox.
+// Upstream's struct stays untouched in instance_seg_postprocess.hpp; we just
+// stop using it inside the shim.
+struct ShimLetterbox {
+    float scale{1.0f};   // dst / src; src*scale == new_w/new_h
+    int new_w{0};        // resized image width
+    int new_h{0};        // resized image height
+    int pad_left{0};     // top-left X offset of resized region in canvas
+    int pad_top{0};      // top-left Y offset of resized region in canvas
+};
+
+// Ultralytics-faithful letterbox: scale by min ratio, centered pad with
+// (114,114,114) gray, bilinear interpolation. Matches LetterBox(center=True)
+// in ultralytics/data/augment.py:1542 and ara2_validator/preprocess.py
+// letterbox(), so the TAPPAS reference pipeline consumes the same model-input
+// bytes as the HAL preprocess path for the same image.
 //
-// We deliberately do NOT use the upstream sample's `pad_crop_to_target` from
-// toolbox.cpp:919 because it is no-resize: it only pads (if input is smaller
-// than model) or top-left crops (if larger), which silently destroys content
-// for typical input sizes. Real Hailo deployments use a proper letterbox; this
-// is the function the upstream code itself uses to undo the geometry on the
-// postprocess side, so using it on both sides keeps preprocess and postprocess
-// consistent.
-//
-// `LetterboxMap` is defined in instance_seg_postprocess.hpp (we use the
-// upstream's struct rather than redeclaring our own).
+// Asymmetric pad rounding: integer split (model_w - new_w) / 2 for left/top
+// paired with (model_w - new_w - pad_left) for right/bottom is exactly
+// equivalent to Ultralytics' round(dw - 0.1) / round(dw + 0.1) rule for
+// every non-negative integer total pad (even or odd). On odd totals the
+// bottom/right side gets the extra pixel. Total pad >= 0 because
+// scale = min(model_w/w, model_h/h) guarantees new_w <= model_w. (If
+// scaleup=False is ever added per spec Section 9 future work, total pad can
+// go negative for small images and C++ integer division semantics diverge
+// from Python //; equivalence breaks in that regime.)
 cv::Mat letterbox_for_model(const cv::Mat &src,
                             int model_w, int model_h,
-                            LetterboxMap &map)
+                            ShimLetterbox &lb)
 {
-    const float fh = static_cast<float>(src.rows) / static_cast<float>(model_h);
-    const float fw = static_cast<float>(src.cols) / static_cast<float>(model_w);
-    map.factor = std::max(fh, fw);
+    lb.scale = std::min(static_cast<float>(model_w) / src.cols,
+                        static_cast<float>(model_h) / src.rows);
+    lb.new_w = static_cast<int>(std::round(src.cols * lb.scale));
+    lb.new_h = static_cast<int>(std::round(src.rows * lb.scale));
 
     cv::Mat resized;
-    cv::resize(src, resized,
-               cv::Size(static_cast<int>(std::round(src.cols / map.factor)),
-                        static_cast<int>(std::round(src.rows / map.factor))),
-               0, 0, cv::INTER_AREA);
+    cv::resize(src, resized, cv::Size(lb.new_w, lb.new_h),
+               0, 0, cv::INTER_LINEAR);
 
-    map.crop_h = resized.rows;
-    map.crop_w = resized.cols;
-    map.pad_h = std::max(0, model_h - resized.rows);
-    map.pad_w = std::max(0, model_w - resized.cols);
+    lb.pad_left = (model_w - lb.new_w) / 2;
+    lb.pad_top  = (model_h - lb.new_h) / 2;
+    const int pad_right  = model_w - lb.new_w - lb.pad_left;
+    const int pad_bottom = model_h - lb.new_h - lb.pad_top;
 
     cv::Mat canvas;
     cv::copyMakeBorder(resized, canvas,
-                       /*top*/ 0, /*bottom*/ map.pad_h,
-                       /*left*/ 0, /*right*/ map.pad_w,
-                       cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+                       lb.pad_top, pad_bottom,
+                       lb.pad_left, pad_right,
+                       cv::BORDER_CONSTANT, cv::Scalar(114, 114, 114));
     return canvas;
 }
 
-// Per-detection mask unmapping: TAPPAS's `filter()` produces masks at model
-// space when called with (model_h, model_w). Crop the valid region (top-left,
-// dims = crop_h x crop_w from the LetterboxMap) and resize to original image
-// dims. This is the per-mask analogue of upstream's `map_model_to_frame`
-// (instance_seg_postprocess.cpp:146) which operates on a whole canvas.
+// Per-detection mask unmap. TAPPAS produced this mask at model space (640x640)
+// because we passed (model_h, model_w) to filter(). After our centered
+// letterbox, the valid region is the (new_w x new_h) sub-rectangle starting
+// at (pad_left, pad_top). The integer pad_left and new_w used here are the
+// same values that constructed the canvas in letterbox_for_model, so there
+// is no rounding drift between the canvas the model saw and the ROI we cut.
+// Defensive clamps below are paranoia against future invariant violations.
 cv::Mat unmap_mask(const cv::Mat &mask_model_space,
-                   const LetterboxMap &map,
+                   const ShimLetterbox &lb,
                    int org_h, int org_w)
 {
-    const int cw = std::min(map.crop_w, mask_model_space.cols);
-    const int ch = std::min(map.crop_h, mask_model_space.rows);
-    cv::Rect roi(0, 0, cw, ch);
-    cv::Mat cropped = mask_model_space(roi).clone();
+    const int x = std::max(0, std::min(lb.pad_left, mask_model_space.cols - 1));
+    const int y = std::max(0, std::min(lb.pad_top,  mask_model_space.rows - 1));
+    const int w = std::min(lb.new_w, mask_model_space.cols - x);
+    const int h = std::min(lb.new_h, mask_model_space.rows - y);
+    cv::Mat cropped = mask_model_space(cv::Rect(x, y, w, h)).clone();
     cv::Mat resized;
-    cv::resize(cropped, resized, cv::Size(org_w, org_h), 0, 0, cv::INTER_LINEAR);
+    cv::resize(cropped, resized, cv::Size(org_w, org_h),
+               0, 0, cv::INTER_LINEAR);
     return resized;
+}
+
+// Test-only accessor: runs cvtColor + letterbox_for_model and returns the
+// canvas. Bound at module level so a Python pytest can verify the shim's
+// preprocess geometry matches the validator's preprocess.letterbox()
+// without needing a HEF or HailoRT.
+py::array_t<uint8_t> letterbox_for_test(
+    py::array_t<uint8_t, py::array::c_style | py::array::forcecast> image_bgr,
+    int model_w, int model_h)
+{
+    auto buf = image_bgr.request();
+    if (buf.ndim != 3 || buf.shape[2] != 3)
+        throw std::runtime_error("input must be (H, W, 3) uint8 BGR");
+    const int h = static_cast<int>(buf.shape[0]);
+    const int w = static_cast<int>(buf.shape[1]);
+    cv::Mat src_bgr(h, w, CV_8UC3, buf.ptr);
+    cv::Mat rgb;
+    cv::cvtColor(src_bgr, rgb, cv::COLOR_BGR2RGB);
+    ShimLetterbox lb{};
+    cv::Mat canvas = letterbox_for_model(rgb, model_w, model_h, lb);
+    py::array_t<uint8_t> out({canvas.rows, canvas.cols, 3});
+    std::memcpy(out.mutable_data(), canvas.data,
+                static_cast<size_t>(canvas.rows) * canvas.cols * 3);
+    return out;
 }
 
 }  // namespace
@@ -223,7 +264,7 @@ public:
         double pre_ms = 0.0, infer_ms = 0.0, post_ms = 0.0;
         std::vector<HailoDetectionPtr> dets;
         std::vector<cv::Mat> masks_model_space;
-        LetterboxMap lbmap{};
+        ShimLetterbox lb{};
 
         {
             // Heavy compute under released GIL.
@@ -243,7 +284,7 @@ public:
             cv::Mat src_bgr(org_h, org_w, CV_8UC3, buf.ptr);   // zero-copy view
             cv::Mat rgb;
             cv::cvtColor(src_bgr, rgb, cv::COLOR_BGR2RGB);
-            cv::Mat letterboxed = letterbox_for_model(rgb, model_w_, model_h_, lbmap);
+            cv::Mat letterboxed = letterbox_for_model(rgb, model_w_, model_h_, lb);
             letterboxed = letterboxed.clone();   // materialization barrier
             pre_ms = ms_since(t_pre);
 
@@ -322,24 +363,25 @@ public:
         auto sm = scores.mutable_unchecked<1>();
         auto cm = classes.mutable_unchecked<1>();
 
-        // Letterbox -> org coordinate mapping for boxes:
-        // bb is normalized [0,1] in letterbox space. The valid region of the
-        // letterboxed canvas spans [0, crop_w/model_w] x [0, crop_h/model_h];
-        // outside that is padding. Multiplying by (model_w / crop_w) rescales
-        // to [0,1] in org space and clamps any padding-region predictions.
-        const float sx = static_cast<float>(model_w_) /
-                         std::max(1, lbmap.crop_w);
-        const float sy = static_cast<float>(model_h_) /
-                         std::max(1, lbmap.crop_h);
+        // bb is normalized [0,1] in letterbox space. Convert to org-normalized
+        // via (bb - pad/model) * (model/new). pad/model rebases the origin to
+        // the start of the valid region; (model/new) rescales the valid span
+        // to [0,1]. Clamp matches Ultralytics' clip_boxes (utils/ops.py:152) —
+        // detections outside the valid region collapse to zero-area at the
+        // edge or get truncated to the image boundary.
+        const float pad_lx_norm = static_cast<float>(lb.pad_left) / model_w_;
+        const float pad_ty_norm = static_cast<float>(lb.pad_top)  / model_h_;
+        const float sx = static_cast<float>(model_w_) / std::max(1, lb.new_w);
+        const float sy = static_cast<float>(model_h_) / std::max(1, lb.new_h);
 
         py::list mask_list;
         for (py::ssize_t i = 0; i < N; ++i) {
             const auto &det = dets[i];
             const auto &bb = det->get_bbox();
-            float x1 = bb.xmin() * sx;
-            float y1 = bb.ymin() * sy;
-            float x2 = (bb.xmin() + bb.width()) * sx;
-            float y2 = (bb.ymin() + bb.height()) * sy;
+            float x1 = (bb.xmin() - pad_lx_norm) * sx;
+            float y1 = (bb.ymin() - pad_ty_norm) * sy;
+            float x2 = (bb.xmin() + bb.width()  - pad_lx_norm) * sx;
+            float y2 = (bb.ymin() + bb.height() - pad_ty_norm) * sy;
             // Clamp to valid org-normalized range
             x1 = std::clamp(x1, 0.0f, 1.0f);
             y1 = std::clamp(y1, 0.0f, 1.0f);
@@ -357,7 +399,7 @@ public:
             const cv::Mat &m = masks_model_space[i];
             if (m.type() != CV_32FC1)
                 throw std::runtime_error("expected float32 mask from filter()");
-            cv::Mat mask_org = unmap_mask(m, lbmap, org_h, org_w);
+            cv::Mat mask_org = unmap_mask(m, lb, org_h, org_w);
             py::array_t<float> mask_np({mask_org.rows, mask_org.cols});
             std::memcpy(mask_np.mutable_data(), mask_org.data,
                         static_cast<size_t>(mask_org.rows) *
@@ -427,4 +469,10 @@ PYBIND11_MODULE(hailo_tappas_baseline, m) {
         .def_property_readonly("model_channels", &HailoTappasBackend::model_channels)
         .def_property_readonly("input_names", &HailoTappasBackend::input_names)
         .def_property_readonly("output_names", &HailoTappasBackend::output_names);
+
+    m.def("letterbox_for_test", &letterbox_for_test,
+          py::arg("image_bgr"), py::arg("model_w") = 640, py::arg("model_h") = 640,
+          "Run cvtColor + the shim's letterbox_for_model on an input BGR image.\n"
+          "Returns the (model_h, model_w, 3) uint8 RGB canvas. Test-only; the\n"
+          "production path is HailoTappasBackend.infer().");
 }

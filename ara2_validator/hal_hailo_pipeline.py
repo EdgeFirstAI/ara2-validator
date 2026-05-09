@@ -309,13 +309,27 @@ class HalHailoPipeline:
         # first 3 dims of an arbitrary schema shape and lands on
         # ``(H, C)`` instead of ``(W, H)``, which produces nonsense
         # boxes (mixed normalized x / pixel y).
+        # NMS mode is exploratory-overridable via HAL_NMS_MODE env var so
+        # we can A/B against the TAPPAS reference (which hardcodes
+        # cross-class / class-agnostic). Default ClassAware matches
+        # Ultralytics + the numpy reference.
+        import os
+        _nms_mode = os.environ.get('HAL_NMS_MODE', 'ClassAware')
+        _nms_map = {'ClassAware': hal.Nms.ClassAware,
+                    'ClassAgnostic': hal.Nms.ClassAgnostic}
         self.decoder = hal.Decoder.new_from_json_str(
             json.dumps(self.embedded_json),
             score_threshold=self.score_threshold,
             iou_threshold=self.iou_threshold,
-            nms=hal.Nms.ClassAware,
+            nms=_nms_map[_nms_mode],
             input_dims=(self.input_w, self.input_h),
         )
+        # HAL defaults pre_nms_top_k=300 and max_det=300. Both can be
+        # raised here so the validator can explore the recall ceiling
+        # at low score thresholds (and to match TAPPAS's "no top-K"
+        # behaviour for head-to-head NMS comparison).
+        self.decoder.max_det = int(max_detections)
+        self.decoder.pre_nms_top_k = int(max_detections)
 
         log.info(
             "HalHailoPipeline: %d×%d×%d in, %d outputs",
@@ -440,15 +454,55 @@ class HalHailoPipeline:
         timings["decode"] = (_time.perf_counter() - t0) * 1e3
 
         # Stage 2: HAL letterbox + copy to HailoRT input.
+        # Preprocess mode selectable via HAL_PREPROCESS env var (exploratory):
+        #   letterbox-centered (default): centered pad + (114,114,114) gray (Ultralytics)
+        #   letterbox-topleft:            bottom/right pad + (0,0,0) black (TAPPAS)
+        #   stretch:                      no pad, distort to fit (hailo-converter calibration shape)
         t0 = _time.perf_counter()
-        scale, pad_x, pad_y, new_w, new_h = compute_letterbox_rect(
-            img_w, img_h, self.input_w, self.input_h,
-        )
-        self.processor.convert(
-            src, self.dst,
-            dst_crop=hal.Rect(pad_x, pad_y, new_w, new_h),
-            dst_color=(114, 114, 114, 255),
-        )
+        import os as _os
+        _pp_mode = _os.environ.get('HAL_PREPROCESS', 'letterbox-centered')
+        if _pp_mode == 'stretch':
+            self.processor.convert(src, self.dst)
+            scale = float(self.input_w) / float(img_w)  # placeholder; box unmap below uses x/y separately
+            pad_x = 0; pad_y = 0; new_w = self.input_w; new_h = self.input_h
+        elif _pp_mode == 'letterbox-topleft':
+            scale, _pcx, _pcy, new_w, new_h = compute_letterbox_rect(
+                img_w, img_h, self.input_w, self.input_h,
+            )
+            pad_x, pad_y = 0, 0  # bottom-right padding only
+            self.processor.convert(
+                src, self.dst,
+                dst_crop=hal.Rect(0, 0, new_w, new_h),
+                dst_color=(0, 0, 0, 255),
+            )
+        elif _pp_mode == 'letterbox-centered-black':
+            scale, pad_x, pad_y, new_w, new_h = compute_letterbox_rect(
+                img_w, img_h, self.input_w, self.input_h,
+            )
+            self.processor.convert(
+                src, self.dst,
+                dst_crop=hal.Rect(pad_x, pad_y, new_w, new_h),
+                dst_color=(0, 0, 0, 255),
+            )
+        elif _pp_mode == 'letterbox-topleft-gray':
+            scale, _pcx, _pcy, new_w, new_h = compute_letterbox_rect(
+                img_w, img_h, self.input_w, self.input_h,
+            )
+            pad_x, pad_y = 0, 0
+            self.processor.convert(
+                src, self.dst,
+                dst_crop=hal.Rect(0, 0, new_w, new_h),
+                dst_color=(114, 114, 114, 255),
+            )
+        else:
+            scale, pad_x, pad_y, new_w, new_h = compute_letterbox_rect(
+                img_w, img_h, self.input_w, self.input_h,
+            )
+            self.processor.convert(
+                src, self.dst,
+                dst_crop=hal.Rect(pad_x, pad_y, new_w, new_h),
+                dst_color=(114, 114, 114, 255),
+            )
         with self.dst.map() as mv:
             np.copyto(
                 self._input_buffer,

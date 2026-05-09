@@ -59,28 +59,44 @@ Python threads.
 
 ## Letterbox: deviation from upstream sample
 
-Upstream's `runtime/cpp/instance_segmentation/instance_segmentation.cpp` calls
-`pad_crop_to_target` (`common/toolbox.cpp:919`) for inference-side preprocessing
-— a no-resize pad-or-crop that just zero-pads if the input is smaller than the
-model and **top-left crops** if larger. That is fine for inputs already at
-640×640 but silently destroys content for typical native-resolution images
-(e.g. a 1920×1080 frame becomes its top-left 640×640 corner).
+The shim's `letterbox_for_model` (and the `letterbox_for_test` accessor that
+wraps it) does an **Ultralytics-faithful YOLO letterbox** — aspect-preserving
+resize with `cv::INTER_LINEAR`, centered padding split evenly between
+top/bottom and left/right (with the bottom/right side taking the extra pixel
+on odd-total pads), and `(114, 114, 114)` gray fill. This matches the
+`LetterBox(center=True)` class in `ultralytics/data/augment.py:1542` (the
+default for Ultralytics' YOLO validation) and the validator's
+`ara2_validator/preprocess.letterbox()`.
 
-The shim instead uses `make_model_space_canvas` semantics
-(`instance_seg_postprocess.cpp:120`) — aspect-preserving resize + pad
-bottom/right with zeros. This matches:
+It deviates from upstream's preprocessing in two places. The upstream
+`runtime/cpp/instance_segmentation/instance_segmentation.cpp` calls
+`pad_crop_to_target` (`common/toolbox.cpp:919`) for inference-side
+preprocessing — a no-resize pad-or-crop that zero-pads small inputs and
+**top-left crops** larger ones, fine for inputs already at 640×640 but
+silently destroys content for typical native-resolution images (e.g. a
+1920×1080 frame becomes its top-left 640×640 corner). Upstream's helper
+`make_model_space_canvas` (`instance_seg_postprocess.cpp:120`), which is what
+the upstream code uses to undo the letterbox on the postprocess side, is
+closer to correct but still differs from Ultralytics on three counts:
+interpolation (`cv::INTER_AREA` instead of `cv::INTER_LINEAR`), padding
+placement (bottom/right anchored instead of centered), and fill colour
+(`(0,0,0)` black instead of `(114,114,114)` gray).
 
-- The function the upstream code itself uses to **undo** the geometry on the
-  postprocess side.
-- The conventional YOLO letterbox.
-- What real Hailo deployments (TAPPAS GStreamer pipelines using `videoscale` +
-  `videobox`) do in production.
+The shim therefore does its own letterbox that is symmetric with the
+postprocess unmap math (also living in the shim, in the box-unmap loop
+inside `infer()` and in `unmap_mask`). The vendored `upstream/` tree is
+not modified — these edits live entirely in `pybind11/hailo_pybind.cpp`.
 
-The pre/post symmetry matters: TAPPAS's `decode_masks` resizes proto masks to
-whatever dims you pass to `filter()`. The shim passes model dims so masks come
-out in letterbox space, then per-mask unmap (`unmap_mask`) applies the inverse
-LetterboxMap to recover original-image coordinates. Boxes get the same
-treatment via a scale/clamp.
+Mask materialization in the shim path is "retina-mode" (continuous-sigmoid
+masks bilinear-upsampled to original-image resolution before any threshold)
+by construction:
+upstream's `decode_masks` produces continuous-sigmoid masks at proto
+resolution, bilinear-upsamples them to model space (640×640) via the
+`(org_image_width, org_image_height)` argument we pass as `(model_w, model_h)`,
+then bbox-crops in normalized letterbox coords (the bbox is letterbox-
+normalized at this point because we haven't unmapped yet). The shim's
+`unmap_mask` then crops the centered valid region from the 640×640 mask
+and bilinear-resizes to original-image dimensions.
 
 ## Hard-coded model parameters (upstream)
 
